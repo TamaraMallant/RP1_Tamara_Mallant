@@ -33,7 +33,7 @@
 #       NOT repeated per solvent.
 # =============================================================================
 
-mode     <- "pos"
+mode     <- "neg"
 data_dir <- "G:/Practice dataset R/20251217_LLE"
 
 # =============================================================================
@@ -50,7 +50,7 @@ n_replicates <- 3
 n_replicates_blank <- 3
 
 # Minimum mean abundance (applied to sample replicates after blank subtraction)
-abundance_threshold <- 50000
+abundance_threshold <- 25000
 
 # Fold-change threshold (sample / general_blank) for Part 1 IS matching
 # and for Part 2 EV_LLE vs each of the three other samples
@@ -662,11 +662,15 @@ p1_long <- bind_rows(lapply(p1_sample_types, function(stype) {
 
 cat(sprintf("  Long IS table: %d rows\n\n", nrow(p1_long)))
 
-# Colour scheme: one colour per sample_type
+# Colour scheme: boxplots are coloured per LLE method (solvent).
+# When both sample types are shown, blank_LLE is distinguished from EV_LLE by
+# transparency rather than by a separate colour.
 type_colours <- setNames(
   c("#E41A1C", "#377EB8")[seq_along(p1_sample_types)], p1_sample_types)
 solvent_colours <- setNames(
   scales::hue_pal()(n_solvents), solvent_names)
+type_alphas <- setNames(
+  c(0.95, 0.40)[seq_along(p1_sample_types)], p1_sample_types)
 
 # =============================================================================
 # PART 1 — BOXPLOT 1: Total IS abundance — solvents × sample types
@@ -679,19 +683,23 @@ p1_long_box     <- droplevels(p1_long_box)
 box_type_levels <- if (boxplot_ev_only) "EV_LLE" else p1_sample_types
 
 p1_box_total <- ggplot(p1_long_box,
-                       aes(x = solvent, y = log10_abu, fill = sample_type)) +
-  geom_boxplot(outlier.size = 0.8, width = 0.6, alpha = 0.85,
-               position = position_dodge(width = 0.75)) +
-  geom_jitter(aes(colour = sample_type), size = 0.6, alpha = 0.4,
+                       aes(x = solvent, y = log10_abu,
+                           fill  = solvent,
+                           alpha = sample_type,
+                           group = interaction(solvent, sample_type))) +
+  geom_boxplot(outlier.size = 0.8, width = 0.6, colour = "grey25",
+               linewidth = 0.3, position = position_dodge(width = 0.75)) +
+  geom_jitter(size = 0.6, colour = "grey20", alpha = 0.4, show.legend = FALSE,
               position = position_jitterdodge(jitter.width = 0.1,
                                               dodge.width  = 0.75)) +
-  scale_fill_manual(values = type_colours)   +
-  scale_colour_manual(values = type_colours) +
+  scale_fill_manual(values = solvent_colours, guide = "none") +
+  scale_alpha_manual(values = type_alphas,
+                     guide = if (boxplot_ev_only) "none" else "legend") +
   labs(
     title    = sprintf("IS abundance — all solvents × sample types (%s mode)", toupper(mode)),
-    subtitle = "Blank-subtracted vs general blank | brackets: t-test p < 0.05 (within-solvent: EV_LLE vs blank_LLE; across-solvent: EV_LLE only)",
+    subtitle = "Blank-subtracted vs general blank | colour = LLE method | brackets: t-test p < 0.05 (within-solvent: EV_LLE vs blank_LLE; across-solvent: EV_LLE only)",
     x = "Solvent", y = "log10(abundance)",
-    fill = "Sample type", colour = "Sample type") +
+    alpha = "Sample type") +
   theme_minimal(base_size = 12) +
   theme(legend.position = "right")
 
@@ -737,15 +745,19 @@ blank_abu_perlipid <- if (boxplot_show_log2fc)
 # PNGs (single plot on a full canvas) vs the 6-per-page PDF grid.
 make_lipid_boxplot <- function(lip, base_size = 9, text_size = 2.5) {
   df_l <- p1_long_box %>% filter(is_name == lip)
-  p_l <- ggplot(df_l, aes(x = solvent, y = log10_abu, fill = sample_type)) +
-    geom_boxplot(outlier.size = 0.5, width = 0.6, alpha = 0.85,
-                 position = position_dodge(width = 0.75)) +
-    geom_jitter(aes(colour = sample_type), size = 0.8, alpha = 0.5,
+  p_l <- ggplot(df_l, aes(x = solvent, y = log10_abu,
+                          fill  = solvent,
+                          alpha = sample_type,
+                          group = interaction(solvent, sample_type))) +
+    geom_boxplot(outlier.size = 0.5, width = 0.6, colour = "grey25",
+                 linewidth = 0.3, position = position_dodge(width = 0.75)) +
+    geom_jitter(size = 0.8, colour = "grey20", alpha = 0.5, show.legend = FALSE,
                 position = position_jitterdodge(jitter.width = 0.1,
                                                 dodge.width  = 0.75)) +
-    scale_fill_manual(values = type_colours)   +
-    scale_colour_manual(values = type_colours) +
-    labs(title = lip, x = NULL, y = "log10(abu)") +
+    scale_fill_manual(values = solvent_colours, guide = "none") +
+    scale_alpha_manual(values = type_alphas,
+                       guide = if (boxplot_ev_only) "none" else "legend") +
+    labs(title = lip, x = NULL, y = "log10(abu)", alpha = "Sample type") +
     theme_minimal(base_size = base_size) +
     theme(legend.position  = "right",
           legend.text      = element_text(size = base_size * 0.8),
