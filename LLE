@@ -1,0 +1,1502 @@
+# =============================================================================
+# EV LLE Ionization Solvent Comparison
+#
+# STUDY DESIGN (per solvent, 4 solvents total):
+#   - EV_LLE        : EV sample after LLE extraction          (per solvent)
+#   - blank_LLE     : Blank LLE (no EV, same extraction)      (per solvent)
+#   - general_blank : General blank                           (shared, 1 set)
+#   - blank_splash  : Blank with Splashmix internal standards (shared, 1 set)
+#
+# PART 1 — IS MATCHING COMPARISON
+#   Blank subtraction: EV_LLE, blank_LLE, blank_splash each vs general_blank.
+#   FC filter applied per sample vs general_blank.
+#   IS-matched features from all three sample types are plotted in:
+#     - Boxplot: total IS abundance across solvents × sample types
+#     - Per-lipid boxplots: solvents × sample types
+#     - Heatmap: IS lipids × (solvent × sample type) replicates
+#
+# PART 2 — EV LIPID IDENTIFICATION (LipidMaps matching)
+#   EV_LLE blank-subtracted against ALL THREE other samples
+#   (blank_LLE, general_blank, blank_splash) — feature must pass FC threshold
+#   vs ALL three to be retained (strictest filter, keeps only true EV signal).
+#   Retained features matched to LipidMaps database.
+#   Heatmap: collapsed sum-composition lipids (e.g. PC 36:1) × solvents.
+#
+# Expected Excel layout (one combined file per mode):
+#   mz |
+#   blank_LLE_sv1_1..n | blank_LLE_sv2_1..n | blank_LLE_sv3_1..n | blank_LLE_sv4_1..n |
+#   EV_LLE_sv1_1..n   | EV_LLE_sv2_1..n   | EV_LLE_sv3_1..n   | EV_LLE_sv4_1..n   |
+#   general_blank_1..n |
+#   blank_splash_1..n
+#
+# NOTE: general_blank and blank_splash are each one shared set of replicates,
+#       NOT repeated per solvent.
+# =============================================================================
+
+mode     <- "pos"
+data_dir <- "G:/Practice dataset R/20251217_LLE"
+
+# =============================================================================
+# USER-ADJUSTABLE PARAMETERS
+# =============================================================================
+
+# Four solvent names — left-to-right order as they appear in the Excel file
+solvent_names <- c("Small volume MTBE", "Big volume MTBE")
+
+# Replicates per solvent (EV_LLE, blank_LLE, blank_splash each have this many)
+n_replicates <- 3
+
+# Replicates for general_blank (shared across all solvents)
+n_replicates_blank <- 3
+
+# Minimum mean abundance (applied to sample replicates after blank subtraction)
+abundance_threshold <- 50000
+
+# Fold-change threshold (sample / general_blank) for Part 1 IS matching
+# and for Part 2 EV_LLE vs each of the three other samples
+fc_threshold <- 3
+
+# Missingness: drop a feature if this many or more replicates are zero
+# (evaluated on the sample replicates, before blank subtraction)
+missingness_count <- 2
+
+# CoV threshold for flagging (%)
+cov_threshold <- 30
+
+# Set TRUE to remove features exceeding cov_threshold; FALSE = flag only
+filter_high_cov <- FALSE
+
+# PPM tolerance for IS matching (Part 1)
+ppm_tolerance <- 3
+
+# PPM tolerance for LipidMaps matching (Part 2) — tighter, since at this
+# stage we want high-confidence EV lipid identifications and isobaric
+# collisions become more problematic with a database this large
+ppm_tolerance_lipidmaps <- 3
+
+# Pareto scaling in heatmaps
+pareto_scaling <- TRUE
+
+# --- Part 1 boxplot display options (total-IS and per-lipid boxplots) ---
+# Show only EV_LLE in the boxplots (drops the blank_LLE boxes/points).
+# The heatmaps and all exported tables are unaffected.
+boxplot_ev_only <- TRUE
+
+# Draw the t-test significance brackets on the boxplots (TRUE = show).
+boxplot_show_significance <- FALSE
+
+# Annotate each solvent's EV_LLE box with its log2 fold-change (grey number
+# above the box). For the total-IS boxplot this is one aggregate value per
+# solvent; for the per-lipid boxplots it is per lipid × solvent.
+boxplot_show_log2fc <- FALSE
+
+# Reference blank for the log2FC annotation: "general_blank" or "blank_LLE".
+# log2FC = log2( (mean EV_LLE + 1) / (mean reference blank + 1) ), computed on
+# the IS-matched abundances shown in the plot.
+boxplot_log2fc_ref <- "general_blank"
+
+# --- Part 2 barplot: number of sum-composition lipids per LLE method ---
+# TRUE  = x-axis is LipidMaps Category, with one bar per solvent within each
+#         category (dodged, colour = LLE method)
+# FALSE = x-axis is solvent, one bar per solvent (overall totals, no categories)
+barplot_by_category <- TRUE
+
+# --- Part 3: LLE recovery (blank_LLE vs blank_splash, per internal standard) ---
+# Recovery(%) = 100 * (blank_LLE abundance) / (mean blank_splash abundance)
+# Computed per IS lipid, per solvent. Bar = mean over blank_LLE replicates;
+# error bar = spread across those replicates.
+#
+# Error-bar statistic: "sd" (standard deviation) or "sem" (standard error)
+recovery_errorbar <- "sd"
+
+# Drop an IS lipid from the recovery plot if its mean blank_splash abundance
+# is below this value (an unreliable denominator inflates recovery wildly).
+recovery_min_splash_abundance <- 0
+
+# Draw a dashed horizontal guide line at 100% recovery
+recovery_show_100_line <- FALSE
+
+# LipidMaps Categories to include in the Part 2 EV lipidome heatmaps
+# (both the clustered and category-grouped versions) and summary table.
+# Set to NULL (or "all") to include every category.
+# Available categories in the filtered LMSD file:
+#   "Fatty Acyls [FA]", "Glycerolipids [GL]", "Glycerophospholipids [GP]",
+#   "Prenol Lipids [PR]", "Sphingolipids [SP]", "Sterol Lipids [ST]",
+#   "Saccharolipids [SL]"
+# Lipids with no category match are labeled "Uncategorized" — include that
+# string in this vector to keep them, or they're dropped along with any
+# excluded category.
+heatmap_categories <- c("Fatty Acyls [FA]", "Glycerolipids [GL]", "Glycerophospholipids [GP]","Sterol Lipids [ST]", "Sphingolipids [SP]")
+
+# Input files
+file_combined <- file.path(data_dir,
+                           if (mode == "pos") "20251217_LLE_positive.xlsx" else "20251217_LLE_negative.xlsx")
+
+file_IS <- file.path(data_dir,
+                     if (mode == "pos") "pos_internal_standards.xlsx" else "neg_internal_standards.xlsx")
+
+# LipidMaps database file (human lipids, pre-filtered: Polyketides and
+# amino-acid-like Fatty Acyl entries already removed)
+file_lipidmaps <- file.path(data_dir, "LMSD_human_lipids.xlsx")
+
+# =============================================================================
+# 0. PACKAGES
+# =============================================================================
+
+library(readxl)
+library(dplyr)
+library(tidyr)
+library(openxlsx)
+library(ggplot2)
+library(patchwork)
+
+# =============================================================================
+# 1. DERIVED COLUMN NAME LAYOUT
+# =============================================================================
+# Column order in file:
+#   mz |
+#   blank_LLE_sv1_1..n | blank_LLE_sv2_1..n | ... | blank_LLE_sv4_1..n |
+#   EV_LLE_sv1_1..n   | EV_LLE_sv2_1..n   | ... | EV_LLE_sv4_1..n   |
+#   general_blank_1..n |
+#   blank_splash_1..n
+#
+# general_blank and blank_splash are shared singletons (not per-solvent).
+
+n_solvents <- length(solvent_names)
+
+blank_LLE_cols     <- unlist(lapply(solvent_names,
+                                    function(sv) paste0("blank_LLE_", sv, "_", seq_len(n_replicates))))
+EV_LLE_cols        <- unlist(lapply(solvent_names,
+                                    function(sv) paste0("EV_LLE_", sv, "_", seq_len(n_replicates))))
+general_blank_cols <- paste0("general_blank_", seq_len(n_replicates_blank))
+blank_splash_cols  <- paste0("blank_splash_",  seq_len(n_replicates_blank))
+
+all_data_cols <- c(blank_LLE_cols, EV_LLE_cols, general_blank_cols, blank_splash_cols)
+
+# Per-solvent column slices (blank_LLE and EV_LLE vary by solvent)
+blank_LLE_by_sv <- setNames(lapply(solvent_names,
+                                   function(sv) paste0("blank_LLE_", sv, "_", seq_len(n_replicates))), solvent_names)
+EV_LLE_by_sv    <- setNames(lapply(solvent_names,
+                                   function(sv) paste0("EV_LLE_", sv, "_", seq_len(n_replicates))), solvent_names)
+
+# blank_splash is shared — same columns used for every solvent in FC comparisons
+blank_splash_by_sv <- setNames(
+  lapply(solvent_names, function(sv) blank_splash_cols), solvent_names)
+
+# Sample type labels (used throughout)
+# blank_splash is shared — its per-solvent entry just repeats the same columns
+sample_types <- c("EV_LLE", "blank_LLE", "blank_splash")
+sample_cols_by_type <- list(
+  EV_LLE       = EV_LLE_by_sv,
+  blank_LLE    = blank_LLE_by_sv,
+  blank_splash = blank_splash_by_sv   # same blank_splash_cols for every solvent
+)
+
+setwd(data_dir)
+
+cat(sprintf("\n=== EV LLE solvent comparison — %s mode ===\n", toupper(mode)))
+cat(sprintf("  Solvents            : %s\n", paste(solvent_names, collapse = ", ")))
+cat(sprintf("  Replicates/solvent  : %d\n", n_replicates))
+cat(sprintf("  General blank reps  : %d\n", n_replicates_blank))
+cat(sprintf("  Abundance threshold : %s\n", format(abundance_threshold, big.mark = ",")))
+cat(sprintf("  FC threshold        : %.1f\n", fc_threshold))
+cat(sprintf("  Missingness count   : drop if >= %d zeros\n", missingness_count))
+cat(sprintf("  CoV threshold       : %.0f%%\n", cov_threshold))
+cat(sprintf("  PPM tolerance (IS)  : %.1f ppm\n", ppm_tolerance))
+cat(sprintf("  PPM tolerance (LM)  : %.1f ppm\n", ppm_tolerance_lipidmaps))
+cat(sprintf("  Pareto scaling      : %s\n\n", pareto_scaling))
+
+# =============================================================================
+# 2. HELPER FUNCTIONS
+# =============================================================================
+
+count_zeros <- function(df, cols) {
+  rowSums(df[, cols, drop = FALSE] == 0, na.rm = TRUE)
+}
+
+row_mean <- function(df, cols) {
+  rowMeans(df[, cols, drop = FALSE], na.rm = TRUE)
+}
+
+row_sd <- function(df, cols) {
+  apply(df[, cols, drop = FALSE], 1, sd, na.rm = TRUE)
+}
+
+# Blank subtraction: (sample_mean + 1) / (blank_mean + 1) >= fc_threshold
+passes_fc <- function(df, sample_cols, blank_cols, threshold = fc_threshold) {
+  smean <- row_mean(df, sample_cols)
+  bmean <- row_mean(df, blank_cols)
+  (smean + 1) / (bmean + 1) >= threshold
+}
+
+match_db <- function(df, db_df, mz_col_db, ppm_tol = ppm_tolerance) {
+  # Returns a list of data frames, one per matching hit (may be multiple per feature)
+  result <- lapply(seq_len(nrow(df)), function(i) {
+    measured   <- df$mz[i]
+    ppm_errors <- ((measured - db_df[[mz_col_db]]) / db_df[[mz_col_db]]) * 1e6
+    hits       <- which(abs(ppm_errors) <= ppm_tol)
+    if (length(hits) == 0L) return(NULL)
+    do.call(rbind, lapply(hits, function(h) {
+      cbind(df[i, , drop = FALSE],
+            db_df[h, , drop = FALSE],
+            ppm_error = round(ppm_errors[h], 3))
+    }))
+  })
+  bind_rows(result)
+}
+
+pareto_scale <- function(mat) {
+  scaled <- t(apply(mat, 1, function(x) {
+    mu  <- mean(x, na.rm = TRUE)
+    sig <- sd(x,   na.rm = TRUE)
+    if (is.na(mu) || is.na(sig) || sig == 0) return(x - mu)
+    (x - mu) / sqrt(sig)
+  }))
+  colnames(scaled) <- colnames(mat)
+  scaled
+}
+
+run_ttest <- function(x, y) {
+  x <- as.numeric(x[!is.na(x)]); y <- as.numeric(y[!is.na(y)])
+  if (length(x) < 2 || length(y) < 2) return(NA_real_)
+  alt <- if (mean(x) > mean(y)) "greater" else "less"
+  tryCatch(t.test(x, y, alternative = alt, var.equal = FALSE)$p.value,
+           error = function(e) NA_real_)
+}
+
+# Two-sided t-test — used for significance brackets on boxplots
+run_ttest_2sided <- function(x, y) {
+  x <- as.numeric(x[!is.na(x)]); y <- as.numeric(y[!is.na(y)])
+  if (length(x) < 2 || length(y) < 2) return(NA_real_)
+  tryCatch(t.test(x, y, alternative = "two.sided", var.equal = FALSE)$p.value,
+           error = function(e) NA_real_)
+}
+
+sig_label <- function(p) {
+  if (is.na(p))  return("ns")
+  if (p < 0.001) return("***")
+  if (p < 0.01)  return("**")
+  if (p < 0.05)  return("*")
+  return("ns")
+}
+
+# Two-sided t-test p-value comparing one grouping variable's two levels,
+# on a value column, within a data frame
+ttest_pair <- function(df, group_col, val_col, g1, g2) {
+  x <- df[[val_col]][df[[group_col]] == g1]
+  y <- df[[val_col]][df[[group_col]] == g2]
+  run_ttest_2sided(x, y)
+}
+
+# Build significance-bracket data for a dodged boxplot of
+# solvent (x-axis) x sample_type (fill/dodge), value column val_col.
+#
+# Returns a data frame with columns: x, xend, y, label — ready for
+# geom_segment + geom_text. Two sets of comparisons:
+#   - within-solvent : p1_sample_types[1] vs p1_sample_types[2] (e.g. EV_LLE vs blank_LLE),
+#                       one bracket per solvent, placed just above that
+#                       solvent's boxes.
+#   - across-solvent : p1_sample_types[1] (e.g. EV_LLE) compared pairwise
+#                       across solvents, placed above the within-solvent
+#                       brackets.
+# Only brackets with p < 0.05 are returned (ns comparisons are omitted).
+build_sig_brackets <- function(df, val_col, solvent_levels, type_levels,
+                               dodge_width = 0.75) {
+  n_types <- length(type_levels)
+  # Dodge offset for 2 groups: each box centred at +/- dodge_width/4
+  half_offsets <- (seq_len(n_types) - (n_types + 1) / 2) * (dodge_width / n_types)
+  pos_by_type  <- setNames(half_offsets, type_levels)
+  
+  y_max  <- max(df[[val_col]], na.rm = TRUE)
+  y_rng  <- diff(range(df[[val_col]], na.rm = TRUE))
+  y_step <- if (is.finite(y_rng) && y_rng > 0) y_rng * 0.08 else 0.1
+  
+  brackets <- list()
+  
+  # --- Within-solvent: type_levels[1] vs type_levels[2], per solvent ---
+  if (n_types >= 2) {
+    for (sv in solvent_levels) {
+      sv_idx <- match(sv, solvent_levels)
+      sub <- df[df$solvent == sv, ]
+      p   <- ttest_pair(sub, "sample_type", val_col, type_levels[1], type_levels[2])
+      if (!is.na(p) && p < 0.05) {
+        brackets[[length(brackets) + 1]] <- data.frame(
+          x      = sv_idx + unname(pos_by_type[type_levels[1]]),
+          xend   = sv_idx + unname(pos_by_type[type_levels[2]]),
+          y      = y_max + y_step,
+          label  = sig_label(p),
+          tier   = "within",
+          stringsAsFactors = FALSE)
+      }
+    }
+  }
+  
+  # --- Across-solvent: type_levels[1] (e.g. EV_LLE) across solvent pairs ---
+  if (length(solvent_levels) >= 2) {
+    pairs <- combn(seq_along(solvent_levels), 2, simplify = FALSE)
+    tier_y <- y_max + y_step * 2
+    for (pr in pairs) {
+      sv1 <- solvent_levels[pr[1]]; sv2 <- solvent_levels[pr[2]]
+      sub1 <- df[df$solvent == sv1 & df$sample_type == type_levels[1], ]
+      sub2 <- df[df$solvent == sv2 & df$sample_type == type_levels[1], ]
+      p <- run_ttest_2sided(sub1[[val_col]], sub2[[val_col]])
+      if (!is.na(p) && p < 0.05) {
+        brackets[[length(brackets) + 1]] <- data.frame(
+          x      = pr[1] + unname(pos_by_type[type_levels[1]]),
+          xend   = pr[2] + unname(pos_by_type[type_levels[1]]),
+          y      = tier_y,
+          label  = sig_label(p),
+          tier   = "across",
+          stringsAsFactors = FALSE)
+        tier_y <- tier_y + y_step
+      }
+    }
+  }
+  
+  if (length(brackets) == 0) return(NULL)
+  bind_rows(brackets)
+}
+
+# Add significance bracket layers (geom_segment + geom_text) to a ggplot,
+# and expand the y-axis to make room. sig_df is the output of
+# build_sig_brackets(); if NULL, returns p unchanged.
+add_sig_layers <- function(p, sig_df, df, val_col, text_size = 3) {
+  if (is.null(sig_df)) return(p)
+  y_max <- max(df[[val_col]], na.rm = TRUE)
+  y_rng <- diff(range(df[[val_col]], na.rm = TRUE))
+  y_step <- if (is.finite(y_rng) && y_rng > 0) y_rng * 0.08 else 0.1
+  y_top  <- max(sig_df$y) + y_step * 1.5
+  
+  p +
+    geom_segment(data = sig_df,
+                 aes(x = x, xend = xend, y = y, yend = y),
+                 inherit.aes = FALSE, linewidth = 0.4) +
+    geom_text(data = sig_df,
+              aes(x = (x + xend) / 2, y = y + y_step * 0.25, label = label),
+              inherit.aes = FALSE, size = text_size) +
+    expand_limits(y = y_top)
+}
+
+# ---------------------------------------------------------------------------
+# log2FC annotation helpers for the Part 1 boxplots.
+# The reference-blank abundances are pulled per is_name × solvent:
+#   - "blank_LLE"    : taken straight from the plot long-table (p1_long)
+#   - "general_blank": IS-matched against the shared general_blank columns
+#                      (general_blank is solvent-independent, so the same
+#                      values are used for every solvent)
+# ---------------------------------------------------------------------------
+get_blank_abu_long <- function(ref) {
+  if (ref == "blank_LLE") {
+    p1_long %>%
+      filter(sample_type == "blank_LLE") %>%
+      select(is_name, solvent, abundance)
+  } else if (ref == "general_blank") {
+    gb    <- raw_all %>% select(mz, all_of(general_blank_cols))
+    gb_is <- match_db(gb, is_ref, "is_mz", ppm_tol = ppm_tolerance)
+    if (is.null(gb_is) || nrow(gb_is) == 0) return(NULL)
+    gb_long <- gb_is %>%
+      select(is_name, all_of(general_blank_cols)) %>%
+      pivot_longer(-is_name, names_to = "rep", values_to = "abundance") %>%
+      filter(!is.na(abundance), abundance > 0) %>%
+      select(is_name, abundance)
+    # Shared across solvents -> replicate the same values for each solvent
+    tidyr::crossing(solvent = solvent_names, gb_long) %>%
+      select(is_name, solvent, abundance)
+  } else {
+    stop("boxplot_log2fc_ref must be 'general_blank' or 'blank_LLE'")
+  }
+}
+
+# Compute log2FC = log2((mean EV + 1)/(mean blank + 1)) per grouping.
+# per_lipid = FALSE -> one value per solvent (for the total-IS boxplot)
+# per_lipid = TRUE  -> one value per is_name × solvent (per-lipid boxplots)
+compute_box_log2fc <- function(box_long, blank_long, per_lipid = FALSE) {
+  if (is.null(blank_long) || nrow(blank_long) == 0) return(NULL)
+  grp <- if (per_lipid) c("is_name", "solvent") else "solvent"
+  ev_mean <- box_long %>%
+    filter(sample_type == "EV_LLE") %>%
+    group_by(across(all_of(grp))) %>%
+    summarise(ev = mean(abundance, na.rm = TRUE), .groups = "drop")
+  bl_mean <- blank_long %>%
+    group_by(across(all_of(grp))) %>%
+    summarise(bl = mean(abundance, na.rm = TRUE), .groups = "drop")
+  left_join(ev_mean, bl_mean, by = grp) %>%
+    filter(!is.na(ev)) %>%
+    mutate(log2fc = log2((ev + 1) / (bl + 1)))
+}
+
+# Add the log2FC numbers above each solvent's EV_LLE box.
+add_log2fc_layer <- function(p, fc_df, box_long, val_col, type_levels,
+                             solvent_levels, dodge_width = 0.75, text_size = 3) {
+  if (is.null(fc_df) || nrow(fc_df) == 0) return(p)
+  n_types      <- length(type_levels)
+  half_offsets <- (seq_len(n_types) - (n_types + 1) / 2) * (dodge_width / n_types)
+  ev_off       <- if ("EV_LLE" %in% type_levels)
+    half_offsets[match("EV_LLE", type_levels)] else 0
+  y_max  <- max(box_long[[val_col]], na.rm = TRUE)
+  y_rng  <- diff(range(box_long[[val_col]], na.rm = TRUE))
+  y_step <- if (is.finite(y_rng) && y_rng > 0) y_rng * 0.05 else 0.1
+  fc_df <- fc_df %>%
+    mutate(x     = match(as.character(solvent), solvent_levels) + ev_off,
+           y     = y_max + y_step,
+           label = sprintf("%+.1f", log2fc))
+  p +
+    geom_text(data = fc_df, aes(x = x, y = y, label = label),
+              inherit.aes = FALSE, size = text_size, colour = "grey25",
+              fontface = "italic") +
+    expand_limits(y = y_max + y_step * 2.5)
+}
+
+color_cov_column <- function(wb, sheet, col_index, cov_vals, start_row = 2) {
+  styles <- list(
+    green  = createStyle(fgFill = "#00B050"),
+    yellow = createStyle(fgFill = "#FFFF00"),
+    red    = createStyle(fgFill = "#FF0000"))
+  for (i in seq_along(cov_vals)) {
+    v <- cov_vals[i]
+    s <- if (!is.na(v) && v <  30) styles$green  else
+      if (!is.na(v) && v <= 50) styles$yellow else styles$red
+    addStyle(wb, sheet, s, rows = start_row + i - 1, cols = col_index)
+  }
+}
+
+write_results_xlsx <- function(df, file, cov_cols = NULL) {
+  wb <- createWorkbook()
+  addWorksheet(wb, "Results")
+  writeData(wb, "Results", df)
+  for (cn in cov_cols)
+    color_cov_column(wb, "Results", which(colnames(df) == cn), df[[cn]])
+  saveWorkbook(wb, file, overwrite = TRUE)
+  cat("  Written:", file, "\n")
+}
+
+# Filesystem-safe name: replace anything that isn't alphanumeric, dot, dash or
+# underscore (covers spaces, colons, slashes, parentheses in IS lipid names),
+# then collapse repeats and trim leading/trailing underscores.
+safe_name <- function(x) {
+  x <- gsub("[^A-Za-z0-9._-]", "_", x)
+  x <- gsub("_+", "_", x)
+  gsub("^_|_$", "", x)
+}
+
+# Robust lipid label: sum composition synonym, falling back to common name,
+# then systematic name, then LipidMaps ID. Ensures every matched feature gets
+# a non-NA, non-blank label (nothing is ever dropped from collapsed tables).
+lipid_label_fallback <- function(sum_comp, common_name, systematic_name, lm_id) {
+  sum_comp        <- as.character(sum_comp)
+  common_name     <- as.character(common_name)
+  systematic_name <- as.character(systematic_name)
+  lm_id           <- as.character(lm_id)
+  
+  is_blank <- function(x) is.na(x) | trimws(x) == ""
+  
+  label <- sum_comp
+  use_common <- is_blank(label)
+  label[use_common] <- common_name[use_common]
+  
+  use_systematic <- is_blank(label)
+  label[use_systematic] <- systematic_name[use_systematic]
+  
+  use_id <- is_blank(label)
+  label[use_id] <- lm_id[use_id]
+  
+  label
+}
+
+heatmap_colours <- c("#00008B","#0000FF","#4169E1","#87CEEB","#FFFFFF",
+                     "#FFB6C1","#FF4500","#FF0000","#8B0000")
+
+# =============================================================================
+# 3. LOAD DATA
+# =============================================================================
+
+cat("Loading data...\n")
+
+# IS reference
+is_ref <- read_excel(file_IS)
+colnames(is_ref)[1:2] <- c("is_name", "is_mz")
+is_ref$is_mz <- as.numeric(is_ref$is_mz)
+is_ref <- is_ref[!is.na(is_ref$is_mz), ]
+cat(sprintf("  IS reference: %d entries\n", nrow(is_ref)))
+
+# LipidMaps database — select mode-appropriate m/z column
+# (Polyketides and amino-acid-like entries already removed upstream;
+# see LMSD_human_lipids_filtered.xlsx)
+lm_raw <- read_excel(file_lipidmaps)
+lm_mz_col <- if (mode == "neg") "Theoretical m/z [M-H]- (neg)" else
+  "Theoretical m/z [M+H]+ (pos)"
+
+lm_db <- lm_raw %>%
+  rename(lm_mz             = all_of(lm_mz_col),
+         lm_exact_mass     = `Exact mass`,
+         lm_common_name    = `Common name`,
+         lm_sum_comp       = `Sum composition synonym`,
+         lm_systematic     = `Systematic name`,
+         lm_category       = `Category`,
+         lm_main_class     = `Main class`,
+         lm_sub_class      = `Sub class`,
+         lm_id             = `LipidMaps ID`) %>%
+  filter(!is.na(lm_mz)) %>%
+  mutate(lm_mz = as.numeric(lm_mz))
+
+cat(sprintf("  LipidMaps DB: %d entries (%s mode, %s)\n",
+            nrow(lm_db), toupper(mode), lm_mz_col))
+
+# Main data file
+raw_all <- read_excel(file_combined)
+colnames(raw_all) <- c("mz", all_data_cols)
+raw_all <- mutate(raw_all,
+                  across(all_of(all_data_cols), as.numeric))
+cat(sprintf("  Combined file: %d features, %d columns\n\n", nrow(raw_all), ncol(raw_all)))
+
+# General blank mean (shared reference for all blank subtractions)
+raw_all$mean_general_blank <- row_mean(raw_all, general_blank_cols)
+
+# =============================================================================
+# PART 1: IS MATCHING — Three sample types vs general_blank
+# =============================================================================
+cat("========================================\n")
+cat("PART 1: IS matching across sample types\n")
+cat("========================================\n\n")
+
+# For each solvent × sample type combination:
+#   1. Missingness filter (sample replicates)
+#   2. Abundance filter (mean sample replicates)
+#   3. FC filter (sample vs general_blank)
+#   4. CoV annotation
+#   5. IS matching (±ppm_tolerance ppm)
+
+p1_results <- list()   # [[sample_type]][[solvent]] = filtered data frame
+p1_IS      <- list()   # [[sample_type]][[solvent]] = IS-matched subset
+
+# blank_splash is excluded from Part 1 IS matching/plots (no per-solvent
+# variants and not relevant to the solvent comparison here)
+p1_sample_types <- setdiff(sample_types, "blank_splash")
+
+for (stype in p1_sample_types) {
+  cat(sprintf("--- Sample type: %s ---\n", stype))
+  p1_results[[stype]] <- list()
+  p1_IS[[stype]]      <- list()
+  
+  for (sv in solvent_names) {
+    cat(sprintf("  Solvent: %s\n", sv))
+    sv_cols <- sample_cols_by_type[[stype]][[sv]]
+    df <- raw_all %>% select(mz, mean_general_blank, all_of(sv_cols))
+    
+    # Missingness
+    miss_fail <- count_zeros(df, sv_cols) >= missingness_count
+    df <- df[!miss_fail, ]
+    cat(sprintf("    After missingness : %d\n", nrow(df)))
+    
+    # Abundance
+    df$mean_sample <- row_mean(df, sv_cols)
+    df <- df[df$mean_sample >= abundance_threshold, ]
+    cat(sprintf("    After abundance   : %d\n", nrow(df)))
+    
+    # FC vs general_blank
+    fc_ok <- passes_fc(df, sv_cols, "mean_general_blank")
+    df <- df[fc_ok, ]
+    cat(sprintf("    After FC filter   : %d\n", nrow(df)))
+    
+    # CoV
+    cov_col <- paste0("CoV_pct_", stype, "_", sv)
+    df[[cov_col]] <- row_sd(df, sv_cols) / df$mean_sample * 100
+    v <- df[[cov_col]]
+    cat(sprintf("    CoV <30%%: %d | 30-50%%: %d | >50%%: %d\n",
+                sum(v < 30, na.rm=TRUE), sum(v >= 30 & v <= 50, na.rm=TRUE),
+                sum(v > 50, na.rm=TRUE)))
+    
+    if (filter_high_cov) {
+      df <- df[is.na(v) | v <= cov_threshold, ]
+      cat(sprintf("    After CoV filter  : %d\n", nrow(df)))
+    }
+    
+    # IS matching
+    is_sub <- match_db(df, is_ref, "is_mz", ppm_tol = ppm_tolerance)
+    cat(sprintf("    IS-matched        : %d rows\n", nrow(is_sub)))
+    
+    p1_results[[stype]][[sv]] <- df
+    p1_IS[[stype]][[sv]]      <- is_sub
+    
+    write_results_xlsx(df,
+                       sprintf("P1_%s_%s_%s_results.xlsx", stype, safe_name(sv), mode),
+                       cov_cols = cov_col)
+    if (nrow(is_sub) > 0)
+      write_results_xlsx(is_sub,
+                         sprintf("P1_%s_%s_%s_IS.xlsx", stype, safe_name(sv), mode),
+                         cov_cols = grep("CoV", colnames(is_sub), value = TRUE))
+    cat("\n")
+  }
+}
+
+# =============================================================================
+# PART 1 — BUILD LONG TABLE FOR IS PLOTS
+# =============================================================================
+cat("Building Part 1 long IS table...\n")
+
+# A unique group label: solvent × sample_type
+p1_long <- bind_rows(lapply(p1_sample_types, function(stype) {
+  bind_rows(lapply(solvent_names, function(sv) {
+    is_df   <- p1_IS[[stype]][[sv]]
+    if (is.null(is_df) || nrow(is_df) == 0) return(NULL)
+    sv_cols <- sample_cols_by_type[[stype]][[sv]]
+    sv_cols <- intersect(sv_cols, colnames(is_df))
+    is_df %>%
+      select(is_name, all_of(sv_cols)) %>%
+      pivot_longer(-is_name, names_to = "rep", values_to = "abundance") %>%
+      mutate(
+        abundance   = as.numeric(abundance),
+        solvent     = sv,
+        sample_type = stype,
+        group       = paste0(sv, "\n", stype)) %>%
+      filter(!is.na(abundance), abundance > 0) %>%
+      mutate(log10_abu = log10(abundance))
+  }))
+})) %>%
+  mutate(
+    solvent     = factor(solvent,     levels = solvent_names),
+    sample_type = factor(sample_type, levels = p1_sample_types),
+    group       = factor(group,
+                         levels = as.vector(outer(solvent_names, p1_sample_types,
+                                                  FUN = function(s, t) paste0(s, "\n", t)))))
+
+cat(sprintf("  Long IS table: %d rows\n\n", nrow(p1_long)))
+
+# Colour scheme: one colour per sample_type
+type_colours <- setNames(
+  c("#E41A1C", "#377EB8")[seq_along(p1_sample_types)], p1_sample_types)
+solvent_colours <- setNames(
+  scales::hue_pal()(n_solvents), solvent_names)
+
+# =============================================================================
+# PART 1 — BOXPLOT 1: Total IS abundance — solvents × sample types
+# =============================================================================
+cat("Part 1 — Boxplot: total IS abundance...\n")
+
+# EV-only toggle: optionally drop blank_LLE from the boxplot data
+p1_long_box     <- if (boxplot_ev_only) filter(p1_long, sample_type == "EV_LLE") else p1_long
+p1_long_box     <- droplevels(p1_long_box)
+box_type_levels <- if (boxplot_ev_only) "EV_LLE" else p1_sample_types
+
+p1_box_total <- ggplot(p1_long_box,
+                       aes(x = solvent, y = log10_abu, fill = sample_type)) +
+  geom_boxplot(outlier.size = 0.8, width = 0.6, alpha = 0.85,
+               position = position_dodge(width = 0.75)) +
+  geom_jitter(aes(colour = sample_type), size = 0.6, alpha = 0.4,
+              position = position_jitterdodge(jitter.width = 0.1,
+                                              dodge.width  = 0.75)) +
+  scale_fill_manual(values = type_colours)   +
+  scale_colour_manual(values = type_colours) +
+  labs(
+    title    = sprintf("IS abundance — all solvents × sample types (%s mode)", toupper(mode)),
+    subtitle = "Blank-subtracted vs general blank | brackets: t-test p < 0.05 (within-solvent: EV_LLE vs blank_LLE; across-solvent: EV_LLE only)",
+    x = "Solvent", y = "log10(abundance)",
+    fill = "Sample type", colour = "Sample type") +
+  theme_minimal(base_size = 12) +
+  theme(legend.position = "right")
+
+# Significance brackets: within-solvent (EV_LLE vs blank_LLE) and
+# across-solvent (EV_LLE only), p < 0.05 — only if enabled
+if (boxplot_show_significance) {
+  sig_total <- build_sig_brackets(
+    p1_long_box, val_col = "log10_abu",
+    solvent_levels = solvent_names,
+    type_levels    = box_type_levels)
+  p1_box_total <- add_sig_layers(p1_box_total, sig_total, p1_long_box, "log10_abu")
+}
+
+# log2FC annotation above each solvent's EV_LLE box — only if enabled
+if (boxplot_show_log2fc) {
+  fc_total <- compute_box_log2fc(
+    p1_long_box, get_blank_abu_long(boxplot_log2fc_ref), per_lipid = FALSE)
+  p1_box_total <- add_log2fc_layer(
+    p1_box_total, fc_total, p1_long_box, "log10_abu",
+    type_levels = box_type_levels, solvent_levels = solvent_names)
+}
+
+ggsave(sprintf("P1_boxplot_total_IS_%s.pdf", mode), p1_box_total,
+       width = max(5, n_solvents * 2.5), height = 6)
+ggsave(sprintf("P1_boxplot_total_IS_%s.png", mode), p1_box_total,
+       width = max(5, n_solvents * 2.5), height = 6, dpi = 200)
+cat("  Boxplot 1 saved\n\n")
+
+# =============================================================================
+# PART 1 — BOXPLOT 2: Per IS lipid, solvents × sample types
+# =============================================================================
+cat("Part 1 — Boxplot: per IS lipid...\n")
+
+plots_per_page <- 6
+lipid_list     <- unique(p1_long_box$is_name)     # EV-only aware
+n_pages        <- ceiling(length(lipid_list) / plots_per_page)
+
+# Per-lipid × solvent reference-blank abundances (computed once) for log2FC
+blank_abu_perlipid <- if (boxplot_show_log2fc)
+  get_blank_abu_long(boxplot_log2fc_ref) else NULL
+
+# Build one ggplot per IS lipid. base_size is scaled up for the standalone
+# PNGs (single plot on a full canvas) vs the 6-per-page PDF grid.
+make_lipid_boxplot <- function(lip, base_size = 9, text_size = 2.5) {
+  df_l <- p1_long_box %>% filter(is_name == lip)
+  p_l <- ggplot(df_l, aes(x = solvent, y = log10_abu, fill = sample_type)) +
+    geom_boxplot(outlier.size = 0.5, width = 0.6, alpha = 0.85,
+                 position = position_dodge(width = 0.75)) +
+    geom_jitter(aes(colour = sample_type), size = 0.8, alpha = 0.5,
+                position = position_jitterdodge(jitter.width = 0.1,
+                                                dodge.width  = 0.75)) +
+    scale_fill_manual(values = type_colours)   +
+    scale_colour_manual(values = type_colours) +
+    labs(title = lip, x = NULL, y = "log10(abu)") +
+    theme_minimal(base_size = base_size) +
+    theme(legend.position  = "right",
+          legend.text      = element_text(size = base_size * 0.8),
+          plot.title       = element_text(size = base_size * 0.9, face = "bold"))
+  
+  if (boxplot_show_significance) {
+    sig_l <- build_sig_brackets(
+      df_l, val_col = "log10_abu",
+      solvent_levels = solvent_names,
+      type_levels    = box_type_levels)
+    p_l <- add_sig_layers(p_l, sig_l, df_l, "log10_abu", text_size = text_size)
+  }
+  
+  if (boxplot_show_log2fc) {
+    fc_l <- compute_box_log2fc(
+      df_l, blank_abu_perlipid %>% filter(is_name == lip), per_lipid = TRUE)
+    p_l <- add_log2fc_layer(
+      p_l, fc_l, df_l, "log10_abu",
+      type_levels = box_type_levels, solvent_levels = solvent_names,
+      text_size = text_size)
+  }
+  p_l
+}
+
+# --- One standalone PNG per IS lipid ---
+for (lip in lipid_list) {
+  p_single <- make_lipid_boxplot(lip, base_size = 12, text_size = 3.5)
+  ggsave(sprintf("P1_boxplot_IS_%s_%s.png", safe_name(lip), mode),
+         p_single, width = max(5, n_solvents * 1.8), height = 5.5, dpi = 200)
+}
+cat(sprintf("  Per-lipid PNGs saved: %d\n", length(lipid_list)))
+
+# --- Paged PDF (6 panels per page), unchanged layout ---
+pdf(sprintf("P1_boxplot_per_lipid_IS_%s.pdf", mode), width = 16, height = 9)
+for (pg in seq_len(n_pages)) {
+  lip_sub <- lipid_list[((pg-1)*plots_per_page+1) : min(pg*plots_per_page, length(lipid_list))]
+  pl <- lapply(lip_sub, make_lipid_boxplot)
+  while (length(pl) < plots_per_page) pl <- c(pl, list(ggplot() + theme_void()))
+  print(wrap_plots(pl, ncol = 3))
+}
+dev.off()
+cat(sprintf("  Per-lipid boxplot PDF saved (%d page%s)\n\n",
+            n_pages, if (n_pages == 1) "" else "s"))
+
+# =============================================================================
+# PART 1 — HEATMAP: IS lipids × (solvent × sample_type) replicates
+# =============================================================================
+cat("Part 1 — Heatmap: IS lipids × replicates...\n")
+
+all_lipids_h <- unique(p1_long$is_name)
+
+# Column order: for each sample_type (excluding blank_splash), for each solvent, rep 1..n
+col_labels_h <- as.vector(outer(p1_sample_types, solvent_names,
+                                FUN = function(t, s) paste0(t, "_", s)))
+col_rep_labels <- unlist(lapply(col_labels_h,
+                                function(g) paste0(g, "_rep", seq_len(n_replicates))))
+
+mat_h <- matrix(NA_real_,
+                nrow = length(all_lipids_h),
+                ncol = length(col_rep_labels),
+                dimnames = list(all_lipids_h, col_rep_labels))
+
+for (stype in p1_sample_types) {
+  for (sv in solvent_names) {
+    sv_cols <- sample_cols_by_type[[stype]][[sv]]
+    for (r in seq_len(n_replicates)) {
+      mat_col <- paste0(stype, "_", sv, "_rep", r)
+      rep_col <- sv_cols[r]
+      for (lip in all_lipids_h) {
+        val <- p1_long$abundance[
+          p1_long$is_name    == lip &
+            p1_long$solvent    == sv  &
+            p1_long$sample_type == stype &
+            p1_long$rep         == rep_col]
+        mat_h[lip, mat_col] <- if (length(val) == 1) val else NA_real_
+      }
+    }
+  }
+}
+
+log2_mat <- log2(mat_h)
+log2_mat[!is.finite(log2_mat)] <- NA
+scaled_h <- if (pareto_scaling) pareto_scale(log2_mat) else log2_mat
+
+mat_imp <- scaled_h
+for (i in seq_len(nrow(mat_imp))) {
+  na_i <- is.na(mat_imp[i, ])
+  if (any(na_i)) mat_imp[i, na_i] <- median(mat_imp[i, ], na.rm = TRUE)
+}
+mat_imp[!is.finite(mat_imp)] <- 0
+
+row_ord  <- rownames(mat_imp)[hclust(dist(mat_imp), method = "complete")$order]
+x_labels <- col_rep_labels
+
+# Separator positions: between groups of (n_replicates) columns per solvent×type combo
+x_sep <- cumsum(rep(n_replicates, length(col_labels_h)))
+x_sep <- x_sep[-length(x_sep)] + 0.5
+
+long_h1 <- data.frame(
+  lipid   = rep(rownames(scaled_h), times = ncol(scaled_h)),
+  x_label = rep(x_labels,           each  = nrow(scaled_h)),
+  value   = as.vector(scaled_h)
+) %>%
+  mutate(
+    x_label = factor(x_label, levels = col_rep_labels),
+    lipid   = factor(lipid,   levels = rev(row_ord)))
+
+sl <- max(abs(range(long_h1$value, na.rm = TRUE)))
+ph <- max(6, length(all_lipids_h) * 0.4)
+pw <- length(col_rep_labels) * 0.45 + 4
+
+p_heat1 <- ggplot(long_h1, aes(x = x_label, y = lipid, fill = value)) +
+  geom_tile(colour = "white", linewidth = 0.2) +
+  { lapply(x_sep, function(xs)
+    geom_vline(xintercept = xs, colour = "grey30", linewidth = 0.8)) } +
+  scale_fill_gradientn(colours = heatmap_colours, limits = c(-sl, sl),
+                       na.value = "grey85",
+                       name = if (pareto_scaling) "Pareto-scaled\nlog2" else "log2(abundance)") +
+  scale_x_discrete(position = "top") +
+  scale_y_discrete(expand = c(0, 0)) +
+  labs(
+    title    = sprintf("IS lipid heatmap — solvents × sample types (%s mode)", toupper(mode)),
+    subtitle = paste0(if (pareto_scaling) "log2 | Pareto scaled" else "log2",
+                      " | grey = NA | rows by complete-linkage clustering\n",
+                      "Column groups: ", paste(col_labels_h, collapse = " | ")),
+    x = NULL, y = "IS lipid") +
+  theme_minimal(base_size = 9) +
+  theme(
+    axis.text.x       = element_text(angle = 45, hjust = 0, vjust = 0, size = 7),
+    axis.text.y       = element_text(size = 8),
+    legend.key.height = unit(1.5, "cm"),
+    panel.grid        = element_blank(),
+    plot.title        = element_text(face = "bold"))
+
+ggsave(sprintf("P1_heatmap_IS_%s.pdf", mode), p_heat1,
+       width = pw, height = ph, limitsize = FALSE)
+ggsave(sprintf("P1_heatmap_IS_%s.png", mode), p_heat1,
+       width = pw, height = ph, limitsize = FALSE, dpi = 180)
+cat("  Heatmap saved\n\n")
+
+# =============================================================================
+# PART 2: EV-SPECIFIC LIPID IDENTIFICATION (LipidMaps)
+# =============================================================================
+cat("========================================\n")
+cat("PART 2: EV lipid identification\n")
+cat("========================================\n\n")
+
+# For each solvent: retain EV_LLE features that pass FC >= fc_threshold
+# vs ALL THREE of: blank_LLE, general_blank, blank_splash.
+# Then match retained features to LipidMaps database.
+
+p2_ev_filtered <- list()   # [[solvent]] = EV features passing all FC filters
+p2_lm_matched  <- list()   # [[solvent]] = LipidMaps-matched features
+
+lm_mz_col_r <- "lm_mz"  # renamed column in lm_db
+
+for (sv in solvent_names) {
+  cat(sprintf("--- Solvent: %s ---\n", sv))
+  
+  ev_cols      <- EV_LLE_by_sv[[sv]]
+  bLLE_cols    <- blank_LLE_by_sv[[sv]]
+  bSplash_cols <- blank_splash_by_sv[[sv]]
+  
+  # Start from raw data, pull all relevant columns
+  df <- raw_all %>%
+    select(mz, mean_general_blank,
+           all_of(ev_cols), all_of(bLLE_cols), all_of(bSplash_cols))
+  
+  # Missingness filter on EV_LLE replicates
+  miss_fail <- count_zeros(df, ev_cols) >= missingness_count
+  df <- df[!miss_fail, ]
+  cat(sprintf("  After missingness         : %d\n", nrow(df)))
+  
+  # Abundance filter on EV_LLE mean
+  df$mean_EV <- row_mean(df, ev_cols)
+  df <- df[df$mean_EV >= abundance_threshold, ]
+  cat(sprintf("  After abundance filter    : %d\n", nrow(df)))
+  
+  # FC filter: EV_LLE vs general_blank
+  fc_vs_gblank  <- passes_fc(df, ev_cols, "mean_general_blank")
+  # FC filter: EV_LLE vs blank_LLE (per-solvent)
+  fc_vs_bLLE    <- passes_fc(df, ev_cols, bLLE_cols)
+  # FC filter: EV_LLE vs blank_splash (per-solvent)
+  fc_vs_bSplash <- passes_fc(df, ev_cols, bSplash_cols)
+  
+  # Must pass ALL three
+  fc_all <- fc_vs_gblank & fc_vs_bLLE & fc_vs_bSplash
+  df <- df[fc_all, ]
+  cat(sprintf("  After FC (all 3 blanks)   : %d\n", nrow(df)))
+  
+  # CoV on EV_LLE replicates
+  cov_col <- paste0("CoV_pct_EV_", sv)
+  df[[cov_col]] <- row_sd(df, ev_cols) / df$mean_EV * 100
+  v <- df[[cov_col]]
+  cat(sprintf("  CoV <30%%: %d | 30-50%%: %d | >50%%: %d\n",
+              sum(v < 30, na.rm=TRUE), sum(v >= 30 & v <= 50, na.rm=TRUE),
+              sum(v > 50, na.rm=TRUE)))
+  
+  if (filter_high_cov) {
+    df <- df[is.na(v) | v <= cov_threshold, ]
+    cat(sprintf("  After CoV filter          : %d\n", nrow(df)))
+  }
+  
+  # Add log2FC columns for transparency
+  df$log2FC_vs_gblank  <- round(log2((df$mean_EV + 1) /
+                                       (row_mean(df, "mean_general_blank") + 1)), 3)
+  df$log2FC_vs_bLLE    <- round(log2((df$mean_EV + 1) /
+                                       (row_mean(df, bLLE_cols) + 1)), 3)
+  df$log2FC_vs_bSplash <- round(log2((df$mean_EV + 1) /
+                                       (row_mean(df, bSplash_cols) + 1)), 3)
+  
+  p2_ev_filtered[[sv]] <- df
+  
+  write_results_xlsx(df,
+                     sprintf("P2_EV_%s_%s_filtered.xlsx", safe_name(sv), mode),
+                     cov_cols = cov_col)
+  
+  # LipidMaps matching
+  lm_sub <- match_db(df, lm_db, lm_mz_col_r, ppm_tol = ppm_tolerance_lipidmaps)
+  cat(sprintf("  LipidMaps-matched         : %d rows\n", nrow(lm_sub)))
+  p2_lm_matched[[sv]] <- lm_sub
+  
+  if (nrow(lm_sub) > 0) {
+    write_results_xlsx(lm_sub,
+                       sprintf("P2_EV_%s_%s_LipidMaps.xlsx", safe_name(sv), mode),
+                       cov_cols = grep("CoV", colnames(lm_sub), value = TRUE))
+    
+    # Collapsed by sum composition (e.g. "PC 36:1")
+    # Falls back to common name, then systematic name, then LipidMaps ID,
+    # so every matched feature is retained under some label.
+    lm_collapsed <- lm_sub %>%
+      mutate(lipid_label = lipid_label_fallback(
+        lm_sum_comp, lm_common_name, lm_systematic, lm_id)) %>%
+      group_by(lipid_label) %>%
+      summarise(
+        n_features      = n(),
+        mz_min          = round(min(mz, na.rm = TRUE), 4),
+        mz_max          = round(max(mz, na.rm = TRUE), 4),
+        mean_abundance  = round(sum(mean_EV, na.rm = TRUE), 1),
+        mean_ppm_error  = round(mean(ppm_error, na.rm = TRUE), 3),
+        category        = paste(unique(na.omit(lm_category)),  collapse = "; "),
+        main_class      = paste(unique(na.omit(lm_main_class)), collapse = "; "),
+        sub_class       = paste(unique(na.omit(lm_sub_class)),  collapse = "; "),
+        lipidmaps_ids   = paste(unique(na.omit(lm_id)), collapse = "; "),
+        .groups = "drop") %>%
+      arrange(desc(mean_abundance))
+    
+    write_results_xlsx(lm_collapsed,
+                       sprintf("P2_EV_%s_%s_LipidMaps_collapsed.xlsx", safe_name(sv), mode))
+    cat(sprintf("  Collapsed sum-comp lipids : %d\n", nrow(lm_collapsed)))
+  }
+  cat("\n")
+}
+
+# =============================================================================
+# PART 2 — HEATMAP: Sum-composition lipids × solvent replicates
+# =============================================================================
+cat("Part 2 — Heatmap: sum-composition lipids × solvent replicates...\n\n")
+
+# Collapse: for each solvent × sum_comp, sum each EV_LLE replicate's
+# abundance separately (heatmap rows = sum-comp lipid species,
+# columns = one per solvent replicate)
+
+p2_heatmap_data <- bind_rows(lapply(solvent_names, function(sv) {
+  lm <- p2_lm_matched[[sv]]
+  if (is.null(lm) || nrow(lm) == 0) return(NULL)
+  
+  # Robust label: sum composition synonym, falling back to common name,
+  # systematic name, then LipidMaps ID — nothing is ever dropped here.
+  lm <- lm %>%
+    mutate(lipid_label = lipid_label_fallback(
+      lm_sum_comp, lm_common_name, lm_systematic, lm_id))
+  
+  ev_cols <- EV_LLE_by_sv[[sv]]
+  
+  # Sum each replicate column per lipid_label (in case multiple m/z hits
+  # map to the same sum-composition label)
+  lm %>%
+    group_by(lipid_label) %>%
+    summarise(across(all_of(ev_cols), ~ sum(.x, na.rm = TRUE)), .groups = "drop") %>%
+    rename_with(~ paste0(sv, "_rep", seq_along(ev_cols)), all_of(ev_cols)) %>%
+    mutate(solvent = sv)
+}))
+
+if (!is.null(p2_heatmap_data) && nrow(p2_heatmap_data) > 0) {
+  
+  # Replicate column labels in solvent x replicate order
+  rep_col_labels <- unlist(lapply(solvent_names,
+                                  function(sv) paste0(sv, "_rep", seq_len(n_replicates))))
+  
+  # Merge per-solvent wide frames into one wide table (rows = lipid_label,
+  # cols = all replicate columns across all solvents)
+  mat_p2_df <- p2_heatmap_data %>%
+    select(-solvent) %>%
+    group_by(lipid_label) %>%
+    summarise(across(everything(), ~ sum(.x, na.rm = TRUE)), .groups = "drop")
+  
+  mat_p2 <- mat_p2_df %>%
+    tibble::column_to_rownames("lipid_label") %>%
+    as.matrix()
+  
+  # Ensure all expected replicate columns exist (fill missing with 0) and
+  # order columns as solvent x replicate
+  missing_cols <- setdiff(rep_col_labels, colnames(mat_p2))
+  if (length(missing_cols) > 0) {
+    fill_mat <- matrix(0, nrow = nrow(mat_p2), ncol = length(missing_cols),
+                       dimnames = list(rownames(mat_p2), missing_cols))
+    mat_p2 <- cbind(mat_p2, fill_mat)
+  }
+  mat_p2 <- mat_p2[, rep_col_labels, drop = FALSE]
+  
+  # Build a lipid_label -> category lookup (one category per label).
+  # If a label maps to multiple categories across solvents/hits, take the
+  # first alphabetically for a stable, single grouping.
+  label_category <- bind_rows(lapply(solvent_names, function(sv) {
+    lm <- p2_lm_matched[[sv]]
+    if (is.null(lm) || nrow(lm) == 0) return(NULL)
+    lm %>%
+      mutate(lipid_label = lipid_label_fallback(
+        lm_sum_comp, lm_common_name, lm_systematic, lm_id)) %>%
+      select(lipid_label, lm_category)
+  })) %>%
+    mutate(lm_category = if_else(is.na(lm_category) | trimws(lm_category) == "",
+                                 "Uncategorized", lm_category)) %>%
+    group_by(lipid_label) %>%
+    summarise(category = sort(unique(lm_category))[1], .groups = "drop")
+  
+  # Apply heatmap_categories filter (NULL or "all" = keep everything)
+  if (!is.null(heatmap_categories) && !identical(heatmap_categories, "all")) {
+    keep_labels <- label_category$lipid_label[label_category$category %in% heatmap_categories]
+    # Labels with no LipidMaps match at all (shouldn't normally happen here,
+    # but handled for completeness) are "Uncategorized"
+    no_cat_labels <- setdiff(rownames(mat_p2), label_category$lipid_label)
+    if ("Uncategorized" %in% heatmap_categories) keep_labels <- c(keep_labels, no_cat_labels)
+    
+    n_before <- nrow(mat_p2)
+    mat_p2 <- mat_p2[rownames(mat_p2) %in% keep_labels, , drop = FALSE]
+    cat(sprintf("  heatmap_categories filter: %d -> %d lipids (categories: %s)\n",
+                n_before, nrow(mat_p2), paste(heatmap_categories, collapse = ", ")))
+  }
+  
+  if (nrow(mat_p2) == 0) {
+    cat("  WARNING: heatmap_categories filter removed all lipids — heatmaps skipped.\n")
+  } else {
+    
+    log2_p2 <- log2(mat_p2 + 1)
+    log2_p2[!is.finite(log2_p2)] <- 0
+    
+    scaled_p2 <- if (pareto_scaling) pareto_scale(log2_p2) else log2_p2
+    
+    # Clustering
+    if (nrow(scaled_p2) > 1) {
+      row_ord_p2 <- rownames(scaled_p2)[
+        hclust(dist(scaled_p2), method = "complete")$order]
+    } else {
+      row_ord_p2 <- rownames(scaled_p2)
+    }
+    
+    long_p2 <- data.frame(
+      lipid   = rep(rownames(scaled_p2), times = ncol(scaled_p2)),
+      x_label = rep(colnames(scaled_p2), each  = nrow(scaled_p2)),
+      value   = as.vector(scaled_p2)
+    ) %>%
+      mutate(
+        lipid   = factor(lipid,   levels = rev(row_ord_p2)),
+        x_label = factor(x_label, levels = rep_col_labels))
+    
+    # Vertical separators between solvent blocks (each block = n_replicates cols)
+    x_sep_p2 <- cumsum(rep(n_replicates, n_solvents))
+    x_sep_p2 <- x_sep_p2[-length(x_sep_p2)] + 0.5
+    
+    sl2 <- max(abs(range(long_p2$value, na.rm = TRUE)))
+    ph2 <- max(6, nrow(scaled_p2) * 0.28)
+    pw2 <- length(rep_col_labels) * 0.6 + 4
+    
+    p_heat2 <- ggplot(long_p2, aes(x = x_label, y = lipid, fill = value)) +
+      geom_tile(colour = "white", linewidth = 0.25) +
+      { lapply(x_sep_p2, function(xs)
+        geom_vline(xintercept = xs, colour = "grey30", linewidth = 0.8)) } +
+      scale_fill_gradientn(colours = heatmap_colours, limits = c(-sl2, sl2),
+                           na.value = "grey85",
+                           name = if (pareto_scaling) "Pareto-scaled\nlog2" else "log2(sum abu + 1)") +
+      scale_x_discrete(position = "top") +
+      scale_y_discrete(expand = c(0, 0)) +
+      labs(
+        title    = sprintf("EV lipidome — sum-composition species × solvent replicates (%s mode)",
+                           toupper(mode)),
+        subtitle = paste0(
+          "EV_LLE filtered vs blank_LLE + general_blank + blank_splash (FC ≥ ", fc_threshold, ")\n",
+          if (pareto_scaling) "log2(sum abu) | Pareto scaled" else "log2(sum abu)",
+          " | rows by complete-linkage clustering | LipidMaps matched (±", ppm_tolerance_lipidmaps, " ppm)"),
+        x = "Solvent replicate", y = "Sum-composition lipid") +
+      theme_minimal(base_size = 10) +
+      theme(
+        axis.text.x       = element_text(angle = 45, hjust = 0, vjust = 0, size = 8),
+        axis.text.y       = element_text(size = 7),
+        legend.key.height = unit(1.5, "cm"),
+        panel.grid        = element_blank(),
+        plot.title        = element_text(face = "bold"))
+    
+    ggsave(sprintf("P2_heatmap_lipidome_%s.pdf", mode), p_heat2,
+           width = pw2, height = ph2, limitsize = FALSE)
+    ggsave(sprintf("P2_heatmap_lipidome_%s.png", mode), p_heat2,
+           width = pw2, height = ph2, limitsize = FALSE, dpi = 180)
+    cat("  Part 2 heatmap saved\n")
+    
+    # Write summary table (rows = lipid_label, cols = solvent replicates)
+    # Built from the (possibly category-filtered) mat_p2 to stay consistent
+    # with the heatmaps.
+    summary_p2 <- as.data.frame(mat_p2) %>%
+      tibble::rownames_to_column("lipid_label") %>%
+      arrange(lipid_label)
+    write_results_xlsx(summary_p2,
+                       sprintf("P2_lipidome_summary_%s.xlsx", mode))
+    
+    # ===========================================================================
+    # PART 2 — HEATMAP (CATEGORY-GROUPED): same matrix, y-axis grouped by
+    # LipidMaps Category, alphabetical category order, alphabetical lipid
+    # order within each category.
+    # ===========================================================================
+    cat("Part 2 — Heatmap: sum-composition lipids grouped by category...\n\n")
+    
+    # label_category was built earlier (before the heatmap_categories filter)
+    
+    # Order rows: categories in alphabetical block order; WITHIN each category,
+    # lipids ordered by complete-linkage clustering (falls back to alphabetical
+    # for categories with <3 lipids or if a distance can't be computed).
+    row_meta_p2 <- data.frame(lipid_label = rownames(mat_p2), stringsAsFactors = FALSE) %>%
+      left_join(label_category, by = "lipid_label") %>%
+      mutate(category = if_else(is.na(category), "Uncategorized", category))
+    
+    cluster_within <- function(labs) {
+      labs <- sort(labs)
+      if (length(labs) < 3) return(labs)
+      sub <- scaled_p2[labs, , drop = FALSE]
+      d   <- tryCatch(dist(sub), error = function(e) NULL)
+      if (is.null(d) || anyNA(as.matrix(d)) || !all(is.finite(as.matrix(d))))
+        return(labs)
+      labs[hclust(d, method = "complete")$order]
+    }
+    
+    row_ord_cat <- unlist(lapply(sort(unique(row_meta_p2$category)), function(ct) {
+      cluster_within(row_meta_p2$lipid_label[row_meta_p2$category == ct])
+    }), use.names = FALSE)
+    
+    # Reorder row_meta_p2 to match row_ord_cat so the category separators
+    # (computed from row_meta_p2's category sequence) line up with the plot.
+    row_meta_p2 <- row_meta_p2[match(row_ord_cat, row_meta_p2$lipid_label), ]
+    
+    long_p2_cat <- data.frame(
+      lipid   = rep(rownames(scaled_p2), times = ncol(scaled_p2)),
+      x_label = rep(colnames(scaled_p2), each  = nrow(scaled_p2)),
+      value   = as.vector(scaled_p2)
+    ) %>%
+      left_join(row_meta_p2, by = c("lipid" = "lipid_label")) %>%
+      mutate(
+        lipid   = factor(lipid,   levels = rev(row_ord_cat)),
+        x_label = factor(x_label, levels = rep_col_labels))
+    
+    # Horizontal separators between category blocks. The plotted y-axis uses
+    # levels = rev(row_ord_cat), so position 1 (bottom) corresponds to the
+    # LAST row of row_meta_p2 and position n (top) to the FIRST row.
+    # Compute block boundaries in this bottom-to-top order.
+    cat_seq_bottom_to_top <- rev(row_meta_p2$category)
+    cat_order  <- unique(cat_seq_bottom_to_top)
+    cat_counts <- table(factor(cat_seq_bottom_to_top, levels = cat_order))
+    y_sep_cat  <- cumsum(as.numeric(cat_counts))
+    y_sep_cat  <- y_sep_cat[-length(y_sep_cat)] + 0.5
+    
+    ph2_cat <- max(6, nrow(scaled_p2) * 0.3)
+    pw2_cat <- length(rep_col_labels) * 0.6 + 4
+    
+    p_heat2_cat <- ggplot(long_p2_cat, aes(x = x_label, y = lipid, fill = value)) +
+      geom_tile(colour = "white", linewidth = 0.25) +
+      { lapply(x_sep_p2, function(xs)
+        geom_vline(xintercept = xs, colour = "grey30", linewidth = 0.8)) } +
+      { lapply(y_sep_cat, function(ys)
+        geom_hline(yintercept = ys, colour = "grey30", linewidth = 0.8)) } +
+      scale_fill_gradientn(colours = heatmap_colours, limits = c(-sl2, sl2),
+                           na.value = "grey85",
+                           name = if (pareto_scaling) "Pareto-scaled\nlog2" else "log2(sum abu + 1)") +
+      scale_x_discrete(position = "top") +
+      scale_y_discrete(expand = c(0, 0)) +
+      labs(
+        title    = sprintf("EV lipidome — sum-composition species by category × solvent replicates (%s mode)",
+                           toupper(mode)),
+        subtitle = paste0(
+          "EV_LLE filtered vs blank_LLE + general_blank + blank_splash (FC ≥ ", fc_threshold, ")\n",
+          if (pareto_scaling) "log2(sum abu) | Pareto scaled" else "log2(sum abu)",
+          " | rows grouped by LipidMaps Category (A-Z), lipids clustered within category",
+          " | LipidMaps matched (±", ppm_tolerance_lipidmaps, " ppm)"),
+        x = "Solvent replicate", y = "Sum-composition lipid") +
+      theme_minimal(base_size = 10) +
+      theme(
+        axis.text.x       = element_text(angle = 45, hjust = 0, vjust = 0, size = 8),
+        axis.text.y       = element_text(size = 7),
+        legend.key.height = unit(1.5, "cm"),
+        panel.grid        = element_blank(),
+        plot.title        = element_text(face = "bold"))
+    
+    ggsave(sprintf("P2_heatmap_lipidome_by_category_%s.pdf", mode), p_heat2_cat,
+           width = pw2_cat, height = ph2_cat, limitsize = FALSE)
+    ggsave(sprintf("P2_heatmap_lipidome_by_category_%s.png", mode), p_heat2_cat,
+           width = pw2_cat, height = ph2_cat, limitsize = FALSE, dpi = 180)
+    cat("  Part 2 category-grouped heatmap saved\n")
+    
+    # Write category assignment table for reference
+    write_results_xlsx(row_meta_p2 %>% select(category, lipid_label),
+                       sprintf("P2_lipidome_categories_%s.xlsx", mode))
+    
+    # ===========================================================================
+    # PART 2 — BARPLOT: number of sum-composition lipids per LLE method
+    # ===========================================================================
+    # A lipid counts for a solvent if it was LipidMaps-matched in that solvent's
+    # EV_LLE features (i.e. it survived the FC-vs-all-three-blanks filter there).
+    # Restricted to the same lipid set as the heatmaps (heatmap_categories).
+    cat("Part 2 — Barplot: lipid counts per LLE method...\n")
+    
+    kept_labels <- rownames(mat_p2)
+    
+    p2_counts <- p2_heatmap_data %>%
+      filter(lipid_label %in% kept_labels) %>%
+      distinct(solvent, lipid_label) %>%
+      left_join(label_category, by = "lipid_label") %>%
+      mutate(category = if_else(is.na(category), "Uncategorized", category))
+    
+    # Totals per solvent (used for the solvent-only variant)
+    p2_counts_total <- p2_counts %>%
+      count(solvent, name = "n_lipids") %>%
+      tidyr::complete(solvent = solvent_names, fill = list(n_lipids = 0)) %>%
+      mutate(solvent = factor(solvent, levels = solvent_names))
+    
+    # Per category x solvent, zero-filled so every category shows all four bars
+    p2_counts_cat <- p2_counts %>%
+      count(category, solvent, name = "n_lipids") %>%
+      tidyr::complete(category = sort(unique(.$category)),
+                      solvent  = solvent_names,
+                      fill     = list(n_lipids = 0)) %>%
+      mutate(solvent  = factor(solvent, levels = solvent_names),
+             category = factor(category, levels = sort(unique(category))))
+    
+    if (barplot_by_category) {
+      # x = LipidMaps category, one bar per solvent within each category
+      p_bar2 <- ggplot(p2_counts_cat,
+                       aes(x = category, y = n_lipids, fill = solvent)) +
+        geom_col(position = position_dodge(width = 0.8), width = 0.7,
+                 colour = "grey20", linewidth = 0.2) +
+        geom_text(aes(label = n_lipids),
+                  position = position_dodge(width = 0.8),
+                  vjust = -0.35, size = 2.8) +
+        scale_fill_manual(values = solvent_colours) +
+        labs(x = "LipidMaps category", fill = "LLE method")
+      bar_ymax <- max(p2_counts_cat$n_lipids, na.rm = TRUE)
+      bar_w    <- max(8, nlevels(p2_counts_cat$category) * n_solvents * 0.5 + 3)
+    } else {
+      # x = solvent, one bar per solvent (overall totals)
+      p_bar2 <- ggplot(p2_counts_total,
+                       aes(x = solvent, y = n_lipids, fill = solvent)) +
+        geom_col(width = 0.65, colour = "grey20", linewidth = 0.2,
+                 show.legend = FALSE) +
+        geom_text(aes(label = n_lipids), vjust = -0.4, size = 3.5,
+                  fontface = "bold") +
+        scale_fill_manual(values = solvent_colours) +
+        labs(x = "LLE method (solvent)")
+      bar_ymax <- max(p2_counts_total$n_lipids, na.rm = TRUE)
+      bar_w    <- max(6, n_solvents * 1.8)
+    }
+    
+    p_bar2 <- p_bar2 +
+      scale_y_continuous(expand = expansion(mult = c(0, 0.10))) +
+      expand_limits(y = bar_ymax * 1.08) +
+      labs(
+        title    = sprintf("EV lipids identified per LLE method (%s mode)", toupper(mode)),
+        subtitle = paste0(
+          "Distinct sum-composition species | EV_LLE filtered vs blank_LLE + general_blank + blank_splash (FC ≥ ",
+          fc_threshold, ")\n",
+          "LipidMaps matched (±", ppm_tolerance_lipidmaps, " ppm)",
+          if (!is.null(heatmap_categories) && !identical(heatmap_categories, "all"))
+            paste0(" | categories: ", paste(heatmap_categories, collapse = ", ")) else ""),
+        y = "Number of lipids (sum composition)") +
+      theme_minimal(base_size = 12) +
+      theme(
+        axis.text.x        = element_text(angle = 30, hjust = 1, size = 9),
+        panel.grid.major.x = element_blank(),
+        plot.title         = element_text(face = "bold"),
+        legend.position    = "right")
+    
+    ggsave(sprintf("P2_barplot_lipid_counts_%s.pdf", mode), p_bar2,
+           width = bar_w, height = 6, limitsize = FALSE)
+    ggsave(sprintf("P2_barplot_lipid_counts_%s.png", mode), p_bar2,
+           width = bar_w, height = 6, limitsize = FALSE, dpi = 200)
+    cat("  Part 2 barplot saved\n")
+    
+    # Counts table: rows = category (+ Total), cols = solvents
+    counts_wide <- p2_counts_cat %>%
+      mutate(category = as.character(category)) %>%
+      tidyr::pivot_wider(names_from = solvent, values_from = n_lipids,
+                         values_fill = 0, names_expand = TRUE) %>%
+      arrange(category)
+    total_row <- p2_counts_total %>%
+      tidyr::pivot_wider(names_from = solvent, values_from = n_lipids,
+                         values_fill = 0, names_expand = TRUE) %>%
+      mutate(category = "Total", .before = 1)
+    write_results_xlsx(bind_rows(counts_wide, total_row),
+                       sprintf("P2_lipid_counts_%s.xlsx", mode))
+    
+  } # end nrow(mat_p2) > 0
+  
+} else {
+  cat("  WARNING: No LipidMaps matches found across any solvent — heatmap skipped.\n")
+}
+
+# =============================================================================
+# PART 3: LLE RECOVERY — EV_LLE vs blank_splash, per internal standard
+# =============================================================================
+cat("\n========================================\n")
+cat("PART 3: LLE recovery (IS)\n")
+cat("========================================\n\n")
+
+# Recovery(%) = 100 * EV_LLE abundance / mean(blank_splash abundance)
+#
+# blank_splash = internal standards spiked into a blank WITHOUT going through
+# the extraction, so it serves as the 100% (un-extracted) reference. EV_LLE
+# = the same standards carried through the LLE in the EV sample, so the ratio
+# is the fraction of each standard surviving extraction with that solvent.
+#
+# NOTE: computed from the RAW abundances (IS-matched only), NOT from the Part 1
+# filtered tables. The Part 1 missingness/abundance/FC filters would silently
+# drop poorly-recovered standards — exactly the signal a recovery plot must show.
+
+p3_cols <- c(EV_LLE_cols, blank_splash_cols)
+p3_raw  <- raw_all %>% select(mz, all_of(p3_cols))
+p3_is   <- match_db(p3_raw, is_ref, "is_mz", ppm_tol = ppm_tolerance)
+
+if (is.null(p3_is) || nrow(p3_is) == 0) {
+  cat("  WARNING: no IS matched in raw data — recovery plot skipped.\n\n")
+} else {
+  
+  # If several m/z features match the same IS, sum them into one value per IS
+  p3_is <- p3_is %>%
+    group_by(is_name) %>%
+    summarise(across(all_of(p3_cols), ~ sum(.x, na.rm = TRUE)), .groups = "drop")
+  cat(sprintf("  IS matched in raw data: %d standards\n", nrow(p3_is)))
+  
+  # --- Denominator: mean blank_splash abundance per IS (the 100% reference) ---
+  splash_ref <- p3_is %>%
+    mutate(splash_mean = rowMeans(across(all_of(blank_splash_cols)), na.rm = TRUE)) %>%
+    select(is_name, splash_mean)
+  
+  n_before_ref <- nrow(splash_ref)
+  splash_ref <- splash_ref %>%
+    filter(!is.na(splash_mean), splash_mean > recovery_min_splash_abundance)
+  cat(sprintf("  Usable splash reference: %d / %d standards (min splash abu = %s)\n",
+              nrow(splash_ref), n_before_ref,
+              format(recovery_min_splash_abundance, big.mark = ",")))
+  
+  if (nrow(splash_ref) == 0) {
+    cat("  WARNING: no IS passed the splash-abundance filter — recovery plot skipped.\n\n")
+  } else {
+    
+    # --- Numerator: per-replicate EV_LLE abundance, long by solvent x rep ---
+    p3_long <- bind_rows(lapply(solvent_names, function(sv) {
+      sv_cols <- EV_LLE_by_sv[[sv]]
+      p3_is %>%
+        select(is_name, all_of(sv_cols)) %>%
+        pivot_longer(-is_name, names_to = "rep", values_to = "abundance") %>%
+        mutate(solvent = sv)
+    })) %>%
+      inner_join(splash_ref, by = "is_name") %>%
+      mutate(
+        abundance    = as.numeric(abundance),
+        recovery_pct = 100 * abundance / splash_mean)
+    
+    # --- Summarise: mean recovery per IS x solvent, with replicate spread ---
+    p3_summary <- p3_long %>%
+      group_by(is_name, solvent) %>%
+      summarise(
+        n_reps        = sum(!is.na(recovery_pct)),
+        mean_recovery = mean(recovery_pct, na.rm = TRUE),
+        sd_recovery   = sd(recovery_pct,   na.rm = TRUE),
+        .groups = "drop") %>%
+      mutate(
+        sd_recovery  = if_else(is.na(sd_recovery), 0, sd_recovery),
+        sem_recovery = if_else(n_reps > 1, sd_recovery / sqrt(n_reps), 0),
+        err  = if (recovery_errorbar == "sem") sem_recovery else sd_recovery,
+        ymin = pmax(mean_recovery - err, 0),   # recovery cannot be negative
+        ymax = mean_recovery + err,
+        solvent = factor(solvent, levels = solvent_names),
+        is_name = factor(is_name, levels = sort(unique(as.character(is_name)))))
+    
+    cat(sprintf("  Recovery computed for %d IS x %d solvents\n",
+                nlevels(p3_summary$is_name), n_solvents))
+    cat(sprintf("  Error bars: %s\n", toupper(recovery_errorbar)))
+    
+    # --- Barplot: x = IS lipid, one bar per solvent, error bar on each bar ---
+    p_bar3 <- ggplot(p3_summary,
+                     aes(x = is_name, y = mean_recovery, fill = solvent)) +
+      geom_col(position = position_dodge(width = 0.8), width = 0.7,
+               colour = "grey20", linewidth = 0.2) +
+      geom_errorbar(aes(ymin = ymin, ymax = ymax),
+                    position = position_dodge(width = 0.8),
+                    width = 0.25, linewidth = 0.35, colour = "grey20") +
+      scale_fill_manual(values = solvent_colours) +
+      scale_y_continuous(expand = expansion(mult = c(0, 0.08))) +
+      labs(
+        title    = sprintf("LLE recovery of internal standards (%s mode)", toupper(mode)),
+        subtitle = paste0(
+          "Recovery = 100 x EV_LLE / mean(blank_splash), per standard | ",
+          "raw IS-matched abundances (\u00b1", ppm_tolerance, " ppm)\n",
+          "Bars = mean of ", n_replicates, " EV_LLE replicates | error bars = ",
+          if (recovery_errorbar == "sem") "SEM" else "SD", " across replicates"),
+        x = "Internal standard", y = "Recovery (%)", fill = "LLE method") +
+      theme_minimal(base_size = 12) +
+      theme(
+        axis.text.x        = element_text(angle = 45, hjust = 1, size = 8),
+        panel.grid.major.x = element_blank(),
+        plot.title         = element_text(face = "bold"),
+        legend.position    = "right")
+    
+    if (recovery_show_100_line)
+      p_bar3 <- p_bar3 +
+      geom_hline(yintercept = 100, linetype = "dashed",
+                 colour = "grey40", linewidth = 0.4)
+    
+    pw3 <- max(8, nlevels(p3_summary$is_name) * n_solvents * 0.22 + 4)
+    ggsave(sprintf("P3_barplot_recovery_IS_%s.pdf", mode), p_bar3,
+           width = pw3, height = 6.5, limitsize = FALSE)
+    ggsave(sprintf("P3_barplot_recovery_IS_%s.png", mode), p_bar3,
+           width = pw3, height = 6.5, limitsize = FALSE, dpi = 200)
+    cat("  Recovery barplot saved\n")
+    
+    # --- Tables ---
+    write_results_xlsx(
+      p3_summary %>%
+        select(is_name, solvent, n_reps, mean_recovery, sd_recovery, sem_recovery) %>%
+        mutate(across(c(mean_recovery, sd_recovery, sem_recovery), ~ round(.x, 2))) %>%
+        arrange(is_name, solvent),
+      sprintf("P3_recovery_summary_%s.xlsx", mode))
+    
+    # Per-replicate detail (abundance + splash reference + recovery)
+    write_results_xlsx(
+      p3_long %>%
+        mutate(recovery_pct = round(recovery_pct, 2)) %>%
+        arrange(is_name, solvent, rep),
+      sprintf("P3_recovery_per_replicate_%s.xlsx", mode))
+    
+    cat("\n")
+  }
+}
+
+cat("\n=== All outputs complete ===\n")
+cat("Part 1 outputs: P1_*\n")
+cat("Part 2 outputs: P2_*\n")
+cat("Part 3 outputs: P3_*\n")
