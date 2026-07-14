@@ -7,9 +7,12 @@
 # Reference: LMSD human lipids file with pre-calculated adduct m/z columns
 # IS Reference: IS lipids file with same column structure as LMSD
 # Output (endogenous): Combined DI + FAIMSoff + FAIMS table; category bar plot;
-#         category heatmap (best CV); all-CVs heatmap; FAIMS vs DI table
+#         category heatmap (best CV); all-CVs heatmap; FAIMS vs DI table;
+#         Venn diagram of sum-composition hits (DI vs FAIMSoff vs FAIMS)
 # Output (IS): Per-sample Excel; heatmaps (best CV + all CVs);
-#              boxplots (best CV + all CVs)
+#              boxplots (best CV + all CVs), with optional per-lipid PNGs
+# NOTE: IS boxplot y-axis is log10(abundance) with NO pseudocount; zero-
+#       abundance replicates are dropped (undefined on a log scale).
 # =============================================================================
 
 # =============================================================================
@@ -46,12 +49,12 @@ cov_green_DI       <- 30 ; cov_yellow_DI       <- 50
 cov_green_FAIMSoff <- 30 ; cov_yellow_FAIMSoff <- 50
 cov_green_FAIMS    <- 30 ; cov_yellow_FAIMS    <- 50
 
-cov_filter_remove_DI       <- TRUE
-cov_filter_remove_FAIMSoff <- TRUE
-cov_filter_remove_FAIMS    <- TRUE
+cov_filter_remove_DI       <- FALSE
+cov_filter_remove_FAIMSoff <- FALSE
+cov_filter_remove_FAIMS    <- FALSE
 
 generate_barplot <- TRUE
-generate_venn    <- TRUE   # NEW: Venn of sum-composition hits DI vs FAIMSoff vs FAIMS
+generate_venn    <- TRUE   # Venn of sum-composition hits DI vs FAIMSoff vs FAIMS
 
 # ---------------------------------------------------------------------------
 # Endogenous heatmap / FAIMS-vs-DI table settings
@@ -68,9 +71,9 @@ faims_di_fc_threshold           <- 1      # highlight |log2FC| > this value
 # ---------------------------------------------------------------------------
 IS_boxplot_significance       <- FALSE   # significance brackets on best-CV boxplots
 IS_boxplot_significance_allCV <- FALSE   # significance brackets on all-CVs boxplots
-IS_boxplot_show_log2FC        <- FALSE   # NEW: log2FC-vs-DI numbers on best-CV boxplots
-IS_boxplot_show_log2FC_allCV  <- FALSE   # NEW: log2FC-vs-DI numbers on all-CVs boxplots
-IS_boxplot_per_lipid_png      <- TRUE    # NEW: also export one PNG per IS lipid
+IS_boxplot_show_log2FC        <- FALSE   # log2FC-vs-DI numbers on best-CV boxplots
+IS_boxplot_show_log2FC_allCV  <- FALSE   # log2FC-vs-DI numbers on all-CVs boxplots
+IS_boxplot_per_lipid_png      <- TRUE    # also export one PNG per IS lipid
 
 # =============================================================================
 # 2. MODE-SPECIFIC FILE PATHS
@@ -157,6 +160,9 @@ max_blank_mean <- function(df, blank_groups) {
   if (is.null(dim(means_mat))) means_mat <- matrix(means_mat, ncol = length(blank_groups))
   apply(means_mat, 1, max, na.rm = TRUE)
 }
+
+# Sanitise a lipid name for use as a filename (names carry : / ; etc.)
+safe_name <- function(x) gsub("[^A-Za-z0-9._-]+", "_", x)
 
 color_cov_column <- function(wb, sheet, col_index, cov_values,
                              green_thresh, yellow_thresh, start_row = 2) {
@@ -540,8 +546,6 @@ run_faims_pipeline <- function(raw_df,
   list(filt = filt, matched = matched, cov_meta = cov_meta,
        cov_cols = cov_cols_out, faims_cv_pass = faims_cv_pass)
 }
-
-safe_name <- function(x) gsub("[^A-Za-z0-9._-]+", "_", x)
 
 # =============================================================================
 # 6. LOAD REFERENCE FILES
@@ -1174,7 +1178,7 @@ for (det in sort(unique(combined_df$detection)))
 cat("\n")
 
 # =============================================================================
-# 11a. WRITE COMBINED EXCEL
+# 11. WRITE COMBINED EXCEL
 # =============================================================================
 
 detection_colours <- c(
@@ -2190,7 +2194,7 @@ if (has_IS_ref) {
   }
   
   # ---------------------------------------------------------------------------
-  # 17d. Heatmap drawing with separators
+  # 17d. Heatmap drawing with separators (x-axis labels on top)
   # ---------------------------------------------------------------------------
   
   heatmap_colours_IS <- c("#00008B","#0000FF","#4169E1","#87CEEB","#FFFFFF",
@@ -2369,6 +2373,10 @@ if (has_IS_ref) {
   
   # ---------------------------------------------------------------------------
   # 17h. Boxplot helper
+  #   Y-axis is log10(abundance), NO pseudocount. Zero-abundance replicates
+  #   are dropped upstream in build_box_long (undefined on a log scale).
+  #   show_log2FC : annotate each non-DI box with log2FC vs DI
+  #   per_lipid_png : also export one PNG per IS lipid
   # ---------------------------------------------------------------------------
   
   make_allcv_colours <- function(long_df) {
@@ -2385,10 +2393,11 @@ if (has_IS_ref) {
   draw_IS_boxplot <- function(long_df, title_str, subtitle_str, file_base,
                               add_sig, show_log2FC = FALSE, per_lipid_png = FALSE,
                               n_cols_facet = 4, cond_colours = NULL) {
-    if (nrow(long_df) == 0) { cat("  No data - boxplot skipped.\n"); return() }
+    if (nrow(long_df) == 0) { cat("  No data — boxplot skipped.\n"); return() }
     if (is.null(cond_colours))
       cond_colours <- c("DI" = "#4472C4", "FAIMSoff" = "#70AD47", "FAIMS" = "#ED7D31")
     
+    # --- significance brackets (per IS lipid) ---
     make_sig_df <- function(df) {
       pairs <- combn(levels(droplevels(df$condition)), 2, simplify = FALSE)
       pairs <- Filter(function(pr) all(pr %in% unique(df$condition)), pairs)
@@ -2396,28 +2405,32 @@ if (has_IS_ref) {
       tryCatch({
         tests <- df %>% group_by(IS_lipid) %>%
           filter({ obs <- table(condition); all(obs[names(obs) %in% unlist(pairs)] >= 2) }) %>%
-          rstatix::t_test(log2_abun ~ condition, comparisons = pairs, p.adjust.method = "BH")
+          rstatix::t_test(log10_abun ~ condition, comparisons = pairs, p.adjust.method = "BH")
+        # Per-lipid y positions (essential for facet_wrap scales = "free_y")
         rng <- df %>% group_by(IS_lipid) %>%
-          summarise(ymax = max(log2_abun, na.rm = TRUE),
-                    yspan = diff(range(log2_abun, na.rm = TRUE)), .groups = "drop")
+          summarise(ymax = max(log10_abun, na.rm = TRUE),
+                    yspan = diff(range(log10_abun, na.rm = TRUE)), .groups = "drop")
         tests %>% left_join(rng, by = "IS_lipid") %>% group_by(IS_lipid) %>%
           mutate(y.position = ymax + yspan * 0.08 * seq_len(n()),
                  xmin = match(group1, levels(df$condition)),
                  xmax = match(group2, levels(df$condition))) %>% ungroup()
-      }, error = function(e) { message("Significance brackets skipped: ", conditionMessage(e)); NULL })
+      }, error = function(e) {
+        message("Significance brackets skipped: ", conditionMessage(e)); NULL
+      })
     }
     
+    # --- log2FC-vs-DI annotation (per IS lipid, per condition) ---
     make_fc_df <- function(df, ref = "DI") {
       lv <- levels(droplevels(df$condition)); if (!ref %in% lv) ref <- lv[1]
       means <- df %>% group_by(IS_lipid, condition) %>%
-        summarise(mean_abun = mean(2^log2_abun - 1, na.rm = TRUE),
-                  ytop = max(log2_abun, na.rm = TRUE), .groups = "drop")
+        summarise(mean_abun = mean(10^log10_abun, na.rm = TRUE),  # back to linear
+                  ytop = max(log10_abun, na.rm = TRUE), .groups = "drop")
       spans <- df %>% group_by(IS_lipid) %>%
-        summarise(pspan = diff(range(log2_abun, na.rm = TRUE)), .groups = "drop")
+        summarise(pspan = diff(range(log10_abun, na.rm = TRUE)), .groups = "drop")
       ref_m <- means %>% filter(condition == ref) %>% select(IS_lipid, ref_abun = mean_abun)
       means %>% left_join(ref_m, by = "IS_lipid") %>% left_join(spans, by = "IS_lipid") %>%
         filter(condition != ref) %>%
-        mutate(log2FC = log2((mean_abun + 1) / (ref_abun + 1)),
+        mutate(log2FC = log2(mean_abun / ref_abun),  # both strictly > 0 (zeros dropped)
                label  = sprintf("%+.2f", log2FC),
                ypos   = ytop + ifelse(is.finite(pspan) & pspan > 0, pspan * 0.05, 0.3)) %>%
         filter(is.finite(log2FC))
@@ -2427,11 +2440,11 @@ if (has_IS_ref) {
     fc_df  <- if (show_log2FC) make_fc_df(long_df)  else NULL
     
     base_plot <- function(df, facet, sig_sub, fc_sub) {
-      p <- ggplot(df, aes(x = condition, y = log2_abun, fill = condition)) +
+      p <- ggplot(df, aes(x = condition, y = log10_abun, fill = condition)) +
         geom_boxplot(outlier.size = 1.2, alpha = 0.8, width = 0.6) +
         geom_jitter(width = 0.15, size = 0.9, alpha = 0.5) +
         scale_fill_manual(values = cond_colours, guide = "none") +
-        labs(x = "Condition / CV", y = "log2(abundance + 1)") +
+        labs(x = "Condition / CV", y = "log10(abundance)") +
         theme_minimal(base_size = 10) +
         theme(strip.text  = element_text(size = 7, face = "bold"),
               axis.text.x = element_text(angle = 35, hjust = 1, size = 7),
@@ -2446,10 +2459,11 @@ if (has_IS_ref) {
       p
     }
     
-    # Faceted overview (unchanged output path)
+    # Faceted overview
     p <- base_plot(long_df, TRUE, sig_df, fc_df) +
       labs(title = title_str,
-           subtitle = paste0(subtitle_str, if (show_log2FC) "\nnumbers above boxes = log2FC vs DI" else ""))
+           subtitle = paste0(subtitle_str,
+                             if (show_log2FC) "\nnumbers above boxes = log2FC vs DI" else ""))
     n_lip <- length(unique(long_df$IS_lipid))
     n_col <- min(n_cols_facet, n_lip); n_row <- ceiling(n_lip / n_col)
     n_cond <- nlevels(droplevels(long_df$condition))
@@ -2480,6 +2494,8 @@ if (has_IS_ref) {
   
   # ---------------------------------------------------------------------------
   # 17i. Build long-format boxplot data
+  #   log10(abundance), NO pseudocount; zero / non-positive values dropped
+  #   (log10 is undefined at 0 — those replicates are non-detections).
   # ---------------------------------------------------------------------------
   
   build_box_long <- function(sample_subset, faims_mode) {
@@ -2491,11 +2507,11 @@ if (has_IS_ref) {
       if (length(di_cols) > 0) {
         sub_mat <- DI_IS_mat[, di_cols, drop = FALSE]
         for (lip in all_is_labels) {
-          v <- as.numeric(sub_mat[lip, ]); v <- v[!is.na(v)]
+          v <- as.numeric(sub_mat[lip, ]); v <- v[!is.na(v) & v > 0]
           if (length(v) > 0)
             rows_list <- c(rows_list, lapply(v, function(x)
               data.frame(IS_lipid = lip, sample = s, condition = "DI",
-                         log2_abun = log2(x + 1), stringsAsFactors = FALSE)))
+                         log10_abun = log10(x), stringsAsFactors = FALSE)))
         }
       }
       # FAIMSoff
@@ -2504,11 +2520,11 @@ if (has_IS_ref) {
         if (length(fo_cols) > 0) {
           sub_mat <- FO_IS_mat[, fo_cols, drop = FALSE]
           for (lip in all_is_labels) {
-            v <- as.numeric(sub_mat[lip, ]); v <- v[!is.na(v)]
+            v <- as.numeric(sub_mat[lip, ]); v <- v[!is.na(v) & v > 0]
             if (length(v) > 0)
               rows_list <- c(rows_list, lapply(v, function(x)
                 data.frame(IS_lipid = lip, sample = s, condition = "FAIMSoff",
-                           log2_abun = log2(x + 1), stringsAsFactors = FALSE)))
+                           log10_abun = log10(x), stringsAsFactors = FALSE)))
           }
         }
       }
@@ -2519,11 +2535,11 @@ if (has_IS_ref) {
         if (length(bc_cols) > 0) {
           sub_mat <- FAIMS_IS_bestcv_mat[, bc_cols, drop = FALSE]
           for (lip in all_is_labels) {
-            v <- as.numeric(sub_mat[lip, ]); v <- v[!is.na(v)]
+            v <- as.numeric(sub_mat[lip, ]); v <- v[!is.na(v) & v > 0]
             if (length(v) > 0)
               rows_list <- c(rows_list, lapply(v, function(x)
                 data.frame(IS_lipid = lip, sample = s, condition = "FAIMS",
-                           log2_abun = log2(x + 1), stringsAsFactors = FALSE)))
+                           log10_abun = log10(x), stringsAsFactors = FALSE)))
           }
         }
       } else {
@@ -2533,11 +2549,11 @@ if (has_IS_ref) {
           if (length(cv_cols) == 0) next
           sub_mat <- FAIMS_IS_allcv_mat[, cv_cols, drop = FALSE]
           for (lip in all_is_labels) {
-            v <- as.numeric(sub_mat[lip, ]); v <- v[!is.na(v)]
+            v <- as.numeric(sub_mat[lip, ]); v <- v[!is.na(v) & v > 0]
             if (length(v) > 0)
               rows_list <- c(rows_list, lapply(v, function(x)
                 data.frame(IS_lipid = lip, sample = s, condition = cv,
-                           log2_abun = log2(x + 1), stringsAsFactors = FALSE)))
+                           log10_abun = log10(x), stringsAsFactors = FALSE)))
           }
         }
       }
@@ -2568,14 +2584,14 @@ if (has_IS_ref) {
                              s, if (has_FAIMSoff) " + FAIMSoff" else "", ppm_threshold),
       file_base    = sub("\\.xlsx$", sprintf("_IS_boxplot_%s_bestCV", s), file_output),
       add_sig      = IS_boxplot_significance,
-      show_log2FC  = IS_boxplot_show_log2FC,       # NEW
-      per_lipid_png = IS_boxplot_per_lipid_png)    # NEW
+      show_log2FC  = IS_boxplot_show_log2FC,
+      per_lipid_png = IS_boxplot_per_lipid_png)
   }
   
   long_all_bcv <- build_box_long(is_signal_samples, "bestCV")
   if (nrow(long_all_bcv) > 0) {
     p_all_bcv <- ggplot(long_all_bcv,
-                        aes(x = condition, y = log2_abun, fill = condition)) +
+                        aes(x = condition, y = log10_abun, fill = condition)) +
       geom_boxplot(outlier.size = 1, alpha = 0.8, width = 0.55) +
       geom_jitter(width = 0.15, size = 0.8, alpha = 0.45) +
       scale_fill_manual(values = c("DI" = "#4472C4", "FAIMSoff" = "#70AD47",
@@ -2584,7 +2600,7 @@ if (has_IS_ref) {
       labs(title    = sprintf("IS lipid abundance — all samples, best CV (%s mode)", toupper(mode)),
            subtitle = sprintf("rows = IS lipid | cols = sample | DI%s + FAIMS best CV | \u00b1%g ppm",
                               if (has_FAIMSoff) " + FAIMSoff" else "", ppm_threshold),
-           x = "Condition", y = "log2(abundance + 1)") +
+           x = "Condition", y = "log10(abundance)") +
       theme_minimal(base_size = 9) +
       theme(strip.text.y = element_text(size = 7, angle = 0, face = "bold"),
             strip.text.x = element_text(size = 8, face = "bold"),
@@ -2616,8 +2632,8 @@ if (has_IS_ref) {
                              paste(cv_labels, collapse = ", "), ppm_threshold),
       file_base    = sub("\\.xlsx$", sprintf("_IS_boxplot_%s_allCV", s), file_output),
       add_sig      = IS_boxplot_significance_allCV,
-      show_log2FC  = IS_boxplot_show_log2FC_allCV, # NEW
-      per_lipid_png = IS_boxplot_per_lipid_png,    # NEW
+      show_log2FC  = IS_boxplot_show_log2FC_allCV,
+      per_lipid_png = IS_boxplot_per_lipid_png,
       cond_colours = pal_s)
   }
   
@@ -2625,7 +2641,7 @@ if (has_IS_ref) {
   if (nrow(long_all_acv) > 0) {
     pal_all <- make_allcv_colours(long_all_acv)
     p_all_acv <- ggplot(long_all_acv,
-                        aes(x = condition, y = log2_abun, fill = condition)) +
+                        aes(x = condition, y = log10_abun, fill = condition)) +
       geom_boxplot(outlier.size = 1, alpha = 0.8, width = 0.6) +
       geom_jitter(width = 0.12, size = 0.7, alpha = 0.4) +
       scale_fill_manual(values = pal_all, guide = "none") +
@@ -2634,7 +2650,7 @@ if (has_IS_ref) {
            subtitle = sprintf("rows = IS lipid | cols = sample | DI%s + FAIMS CVs {%s} | \u00b1%g ppm",
                               if (has_FAIMSoff) " + FAIMSoff" else "",
                               paste(cv_labels, collapse = ", "), ppm_threshold),
-           x = "Condition / CV", y = "log2(abundance + 1)") +
+           x = "Condition / CV", y = "log10(abundance)") +
       theme_minimal(base_size = 9) +
       theme(strip.text.y = element_text(size = 7, angle = 0, face = "bold"),
             strip.text.x = element_text(size = 8, face = "bold"),
@@ -2654,6 +2670,7 @@ if (has_IS_ref) {
   # 17l-extra. Log10 abundance spread boxplot — one box per condition,
   #            all IS lipids x all samples pooled as observations.
   #            Shows overall signal level and spread; each dot = one replicate.
+  #            y is already log10(abundance) from build_box_long (no pseudocount).
   # ---------------------------------------------------------------------------
   
   cat("\n--- IS log10 abundance spread boxplot ---\n")
@@ -2661,11 +2678,7 @@ if (has_IS_ref) {
   if (exists("long_all_bcv") && nrow(long_all_bcv) > 0) {
     
     spread_df <- long_all_bcv %>%
-      mutate(
-        abundance  = 2^log2_abun - 1,
-        log10_abun = log10(abundance + 1),
-        condition  = factor(condition, levels = levels(long_all_bcv$condition))
-      )
+      mutate(condition = factor(condition, levels = levels(long_all_bcv$condition)))
     
     cond_colours_spread <- c("DI" = "#4472C4", "FAIMSoff" = "#70AD47", "FAIMS" = "#ED7D31")
     
@@ -2682,7 +2695,7 @@ if (has_IS_ref) {
         subtitle = sprintf(
           "All IS lipids pooled | DI%s + FAIMS best CV | \u00b1%g ppm | each point = 1 replicate, coloured by IS lipid",
           if (has_FAIMSoff) " + FAIMSoff" else "", ppm_threshold),
-        x = "Condition", y = "log10(abundance + 1)"
+        x = "Condition", y = "log10(abundance)"
       ) +
       theme_minimal(base_size = 11) +
       theme(strip.text      = element_text(size = 10, face = "bold"),
