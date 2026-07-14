@@ -1,0 +1,2826 @@
+# =============================================================================
+# MS Data Analysis — Generalised N-Sample Design
+# Positive or negative mode, DI + FAIMSoff + single/multiple FAIMS
+# Endogenous lipid matching: signal = sEVLS, blanks = BBISS + BLE + BSM
+# IS lipid matching:         signal = sEVLS + BLE + BSM, blank = BBISS only
+# Filters: Missingness, Abundance, Fold Change (max blank) | CoV on signal(s)
+# Reference: LMSD human lipids file with pre-calculated adduct m/z columns
+# IS Reference: IS lipids file with same column structure as LMSD
+# Output (endogenous): Combined DI + FAIMSoff + FAIMS table; category bar plot;
+#         category heatmap (best CV); all-CVs heatmap; FAIMS vs DI table
+# Output (IS): Per-sample Excel; heatmaps (best CV + all CVs);
+#              boxplots (best CV + all CVs)
+# =============================================================================
+
+# =============================================================================
+# 1. USER SETTINGS
+# =============================================================================
+
+mode     <- "neg"
+data_dir <- "G:/Practice dataset R/20260116_FAIMS_JEG3"
+
+cv_values_user <- c(0, 5, 10, 15, 20, 25, 30, 35, 40, 45, 50)
+
+sample_names   <- c("BBISS", "BLE", "BSM", "sEVLS")
+signal_samples <- c("sEVLS")          # endogenous: signal vs. all blanks
+n_replicates   <- 4
+ppm_threshold  <- 3
+
+# ---------------------------------------------------------------------------
+# IS-specific sample roles
+#   is_signal_samples : samples that contain IS (signal for IS matching)
+#   is_blank_samples  : blank for IS fold-change subtraction (BBISS only)
+# ---------------------------------------------------------------------------
+is_signal_samples <- c("BLE", "BSM", "sEVLS")
+is_blank_samples  <- c("BBISS")
+
+abundance_threshold_DI       <- 25000
+abundance_threshold_FAIMSoff <- 25000
+abundance_threshold_FAIMS    <- 25000
+
+fold_change_threshold    <- 3
+fold_change_threshold_IS <- 3        # can differ from endogenous if needed
+max_zeros_allowed        <- 2
+
+cov_green_DI       <- 30 ; cov_yellow_DI       <- 50
+cov_green_FAIMSoff <- 30 ; cov_yellow_FAIMSoff <- 50
+cov_green_FAIMS    <- 30 ; cov_yellow_FAIMS    <- 50
+
+cov_filter_remove_DI       <- TRUE
+cov_filter_remove_FAIMSoff <- TRUE
+cov_filter_remove_FAIMS    <- TRUE
+
+generate_barplot <- TRUE
+generate_venn    <- TRUE   # NEW: Venn of sum-composition hits DI vs FAIMSoff vs FAIMS
+
+# ---------------------------------------------------------------------------
+# Endogenous heatmap / FAIMS-vs-DI table settings
+# ---------------------------------------------------------------------------
+generate_heatmap                <- TRUE
+generate_heatmap_all_cv         <- TRUE
+generate_faims_di_table         <- TRUE
+heatmap_categories              <- NULL   # NULL/"all" = all categories
+heatmap_cluster_within_category <- TRUE
+faims_di_fc_threshold           <- 1      # highlight |log2FC| > this value
+
+# ---------------------------------------------------------------------------
+# IS output settings
+# ---------------------------------------------------------------------------
+IS_boxplot_significance       <- FALSE   # significance brackets on best-CV boxplots
+IS_boxplot_significance_allCV <- FALSE   # significance brackets on all-CVs boxplots
+IS_boxplot_show_log2FC        <- FALSE   # NEW: log2FC-vs-DI numbers on best-CV boxplots
+IS_boxplot_show_log2FC_allCV  <- FALSE   # NEW: log2FC-vs-DI numbers on all-CVs boxplots
+IS_boxplot_per_lipid_png      <- TRUE    # NEW: also export one PNG per IS lipid
+
+# =============================================================================
+# 2. MODE-SPECIFIC FILE PATHS
+# =============================================================================
+
+if (mode == "pos") {
+  file_DI        <- file.path(data_dir, "DI_positive_20260116.xlsx")
+  file_FAIMSoff  <- file.path(data_dir, "FAIMSoff_positive_20260116.xlsx")
+  file_FAIMS     <- file.path(data_dir, "FAIMS_positive_20260116.xlsx")
+  file_lipid_ref <- file.path(data_dir, "LMSD_human_lipids.xlsx")
+  file_IS_ref    <- file.path(data_dir, "pos_internal_standards.xlsx")
+  file_output    <- file.path(data_dir, "Combined_output_positive.xlsx")
+  cv_values      <- cv_values_user
+} else if (mode == "neg") {
+  file_DI        <- file.path(data_dir, "DI_negative_20260116.xlsx")
+  file_FAIMSoff  <- file.path(data_dir, "FAIMSoff_negative_20260116.xlsx")
+  file_FAIMS     <- file.path(data_dir, "FAIMS_negative_20260116.xlsx")
+  file_lipid_ref <- file.path(data_dir, "LMSD_human_lipids.xlsx")
+  file_IS_ref    <- file.path(data_dir, "neg_internal_standards.xlsx")
+  file_output    <- file.path(data_dir, "Combined_output_negative.xlsx")
+  cv_values      <- cv_values_user
+} else {
+  stop("mode must be 'pos' or 'neg'")
+}
+
+has_FAIMSoff <- !is.null(file_FAIMSoff) && file.exists(file_FAIMSoff)
+has_IS_ref   <- !is.null(file_IS_ref)   && file.exists(file_IS_ref)
+
+# =============================================================================
+# 3. PACKAGES
+# =============================================================================
+
+library(readxl)
+library(dplyr)
+library(tidyr)
+library(openxlsx)
+
+# =============================================================================
+# 4. DERIVED SETTINGS
+# =============================================================================
+
+if (!all(signal_samples    %in% sample_names)) stop("All signal_samples must be in sample_names.")
+if (!all(is_signal_samples %in% sample_names)) stop("All is_signal_samples must be in sample_names.")
+if (!all(is_blank_samples  %in% sample_names)) stop("All is_blank_samples must be in sample_names.")
+
+blank_samples <- setdiff(sample_names, signal_samples)
+if (length(blank_samples) == 0)
+  stop("At least one sample must be a blank (not listed in signal_samples).")
+
+n_signals    <- length(signal_samples)
+n_conditions <- length(cv_values)
+cv_labels    <- paste0("CV", cv_values)
+
+if (mode == "pos") {
+  adduct_cols   <- c("Theoretical m/z [M+H]+ (pos)", "Theoretical m/z [M+NH4]+ (pos)")
+  adduct_labels <- c("H+", "NH4+")
+} else {
+  adduct_cols   <- c("Theoretical m/z [M-H]- (neg)", "Theoretical m/z [M+HCOO]- (neg)")
+  adduct_labels <- c("H-", "HCOO-")
+}
+
+cat(sprintf("\n=== Running in %s mode ===\n", toupper(mode)))
+cat(sprintf("Endogenous — signal: %s | blanks: %s\n",
+            paste(signal_samples,  collapse = ", "),
+            paste(blank_samples,   collapse = ", ")))
+cat(sprintf("IS          — signal: %s | blank:  %s\n",
+            paste(is_signal_samples, collapse = ", "),
+            paste(is_blank_samples,  collapse = ", ")))
+cat(sprintf("IS reference present : %s\n",  if (has_IS_ref) file_IS_ref else "no"))
+cat(sprintf("FAIMSoff present     : %s\n\n", if (has_FAIMSoff) file_FAIMSoff else "no"))
+
+# =============================================================================
+# 5. HELPER FUNCTIONS
+# =============================================================================
+
+count_zeros <- function(df, cols) {
+  rowSums(df[, cols, drop = FALSE] == 0, na.rm = TRUE)
+}
+
+max_blank_mean <- function(df, blank_groups) {
+  means_mat <- sapply(blank_groups, function(cols) {
+    rowMeans(df[, intersect(cols, colnames(df)), drop = FALSE], na.rm = TRUE)
+  })
+  if (is.null(dim(means_mat))) means_mat <- matrix(means_mat, ncol = length(blank_groups))
+  apply(means_mat, 1, max, na.rm = TRUE)
+}
+
+color_cov_column <- function(wb, sheet, col_index, cov_values,
+                             green_thresh, yellow_thresh, start_row = 2) {
+  # Batch by colour: 3 addStyle calls total regardless of row count,
+  # instead of one per row (extremely slow on large sheets).
+  row_indices <- start_row - 1L + seq_along(cov_values)
+  green_rows  <- row_indices[!is.na(cov_values) & cov_values <  green_thresh]
+  yellow_rows <- row_indices[!is.na(cov_values) & cov_values >= green_thresh &
+                               cov_values <= yellow_thresh]
+  red_rows    <- row_indices[is.na(cov_values)  | cov_values >  yellow_thresh]
+  if (length(green_rows)  > 0)
+    addStyle(wb, sheet, createStyle(fgFill = "#00B050"),
+             rows = green_rows,  cols = col_index, gridExpand = FALSE, stack = TRUE)
+  if (length(yellow_rows) > 0)
+    addStyle(wb, sheet, createStyle(fgFill = "#FFFF00"),
+             rows = yellow_rows, cols = col_index, gridExpand = FALSE, stack = TRUE)
+  if (length(red_rows)    > 0)
+    addStyle(wb, sheet, createStyle(fgFill = "#FF0000"),
+             rows = red_rows,    cols = col_index, gridExpand = FALSE, stack = TRUE)
+}
+
+write_xlsx_cov <- function(df, file, cov_meta = list()) {
+  wb <- createWorkbook()
+  addWorksheet(wb, "Results")
+  writeData(wb, "Results", df)
+  for (cn in names(cov_meta)) {
+    idx <- which(colnames(df) == cn)
+    if (length(idx))
+      color_cov_column(wb, "Results", idx, df[[cn]],
+                       green_thresh  = cov_meta[[cn]]$green,
+                       yellow_thresh = cov_meta[[cn]]$yellow)
+  }
+  saveWorkbook(wb, file, overwrite = TRUE)
+  cat("Written:", file, "\n")
+}
+
+write_faims_di_table <- function(df, file, fc_col, fc_threshold, p_col) {
+  wb <- createWorkbook()
+  addWorksheet(wb, "Results")
+  writeData(wb, "Results", df)
+  green <- createStyle(fgFill = "#C6EFCE")
+  fc_idx <- which(colnames(df) == fc_col)
+  if (length(fc_idx)) {
+    sig_rows <- which(!is.na(df[[fc_col]]) & abs(df[[fc_col]]) > fc_threshold)
+    if (length(sig_rows))
+      addStyle(wb, "Results", green, rows = sig_rows + 1, cols = fc_idx,
+               gridExpand = TRUE, stack = TRUE)
+  }
+  p_idx <- which(colnames(df) == p_col)
+  if (length(p_idx)) {
+    sig_rows <- which(!is.na(df[[p_col]]) & df[[p_col]] < 0.05)
+    if (length(sig_rows))
+      addStyle(wb, "Results", green, rows = sig_rows + 1, cols = p_idx,
+               gridExpand = TRUE, stack = TRUE)
+  }
+  saveWorkbook(wb, file, overwrite = TRUE)
+  cat("Written:", file, "\n")
+}
+
+print_cov_summary <- function(cov_vec, label, green_thresh, yellow_thresh) {
+  cat(sprintf("%s CoV summary:\n", label))
+  cat(sprintf("  <%.0f%%    : %d\n",  green_thresh,
+              sum(cov_vec <  green_thresh, na.rm = TRUE)))
+  cat(sprintf("  %.0f-%.0f%%: %d\n",  green_thresh, yellow_thresh,
+              sum(cov_vec >= green_thresh & cov_vec <= yellow_thresh, na.rm = TRUE)))
+  cat(sprintf("  >%.0f%%    : %d\n",  yellow_thresh,
+              sum(cov_vec >  yellow_thresh, na.rm = TRUE)))
+}
+
+pareto_scale <- function(mat) {
+  scaled <- t(apply(mat, 1, function(x) {
+    mu  <- mean(x, na.rm = TRUE)
+    sig <- sd(x,   na.rm = TRUE)
+    if (is.na(mu) || is.na(sig) || sig == 0) return(x - mu)
+    (x - mu) / sqrt(sig)
+  }))
+  colnames(scaled) <- colnames(mat)
+  scaled
+}
+
+match_lmsd <- function(df, ref_df, adduct_cols, adduct_labels,
+                       ppm_thresh, source_tag) {
+  result <- lapply(seq_len(nrow(df)), function(i) {
+    measured  <- df$mz[i]
+    hits_list <- lapply(seq_along(adduct_cols), function(a) {
+      theo       <- ref_df[[adduct_cols[a]]]
+      ppm_errors <- ((measured - theo) / theo) * 1e6
+      idx        <- which(abs(ppm_errors) <= ppm_thresh & !is.na(ppm_errors))
+      if (length(idx) == 0L) return(NULL)
+      do.call(rbind, lapply(idx, function(h) {
+        cbind(
+          data.frame(
+            lmsd_id             = ref_df$`LipidMaps ID`[h],
+            sum_composition_syn = ref_df$`Sum composition synonym`[h],
+            common_name         = ref_df$`Common name`[h],
+            systematic_name     = ref_df$`Systematic name`[h],
+            category            = ref_df$Category[h],
+            main_class          = ref_df$`Main class`[h],
+            sub_class           = ref_df$`Sub class`[h],
+            kegg_id             = ref_df$`KEGG ID`[h],
+            adduct              = adduct_labels[a],
+            theoretical_mz      = theo[h],
+            ppm_error           = round(ppm_errors[h], 4),
+            stringsAsFactors    = FALSE
+          ),
+          df[i, , drop = FALSE]
+        )
+      }))
+    })
+    do.call(rbind, hits_list)
+  })
+  out <- bind_rows(result)
+  if (nrow(out) > 0) out$source <- source_tag
+  out
+}
+
+collapse_to_sum_composition <- function(matched_df) {
+  if (nrow(matched_df) == 0) return(matched_df)
+  matched_df$group_key <- ifelse(
+    !is.na(matched_df$sum_composition_syn) & matched_df$sum_composition_syn != "",
+    paste(matched_df$sum_composition_syn, matched_df$adduct, sep = "|||"),
+    paste(matched_df$lmsd_id,             matched_df$adduct, sep = "|||")
+  )
+  fixed_cols <- c("lmsd_id", "sum_composition_syn", "common_name",
+                  "systematic_name", "category", "main_class", "sub_class",
+                  "kegg_id", "adduct", "theoretical_mz", "ppm_error",
+                  "mz", "source", "passing_CVs", "group_key")
+  abun_cols <- setdiff(colnames(matched_df), fixed_cols)
+  result <- lapply(unique(matched_df$group_key), function(key) {
+    grp    <- matched_df[matched_df$group_key == key, , drop = FALSE]
+    best_i <- which.min(abs(grp$ppm_error))
+    collapse_unique <- function(x)
+      paste(unique(x[!is.na(x) & x != ""]), collapse = "; ")
+    out <- grp[best_i, , drop = FALSE]
+    out$lmsd_id         <- collapse_unique(grp$lmsd_id)
+    out$common_name     <- collapse_unique(grp$common_name)
+    out$systematic_name <- collapse_unique(grp$systematic_name)
+    out$kegg_id         <- collapse_unique(grp$kegg_id)
+    if ("passing_CVs" %in% colnames(grp)) {
+      all_cvs <- unique(unlist(strsplit(
+        grp$passing_CVs[!is.na(grp$passing_CVs)], ",\\s*")))
+      out$passing_CVs <- if (length(all_cvs) > 0)
+        paste(sort(all_cvs), collapse = ", ") else NA_character_
+    }
+    out[, abun_cols] <- grp[best_i, abun_cols, drop = FALSE]
+    out
+  })
+  bind_rows(result)
+}
+
+# ---------------------------------------------------------------------------
+# Generic DI-style pipeline — parameterised for endogenous and IS runs
+# ---------------------------------------------------------------------------
+run_di_style_pipeline <- function(raw_df,
+                                  sample_cols_list,
+                                  signal_samples,
+                                  blank_samples,
+                                  n_replicates,
+                                  abundance_threshold,
+                                  fold_change_threshold,
+                                  max_zeros_allowed,
+                                  cov_green, cov_yellow,
+                                  cov_filter_remove,
+                                  lmsd, adduct_cols, adduct_labels,
+                                  ppm_threshold,
+                                  source_tag,
+                                  file_filtered, file_matched) {
+  
+  signal_cols_list <- sample_cols_list[signal_samples]
+  blank_groups     <- sample_cols_list[blank_samples]
+  n_sig            <- length(signal_samples)
+  
+  # Filter 1: Missingness
+  miss_ok <- sapply(signal_cols_list, function(cols)
+    count_zeros(raw_df, cols) < max_zeros_allowed)
+  if (is.null(dim(miss_ok))) miss_ok <- matrix(miss_ok, ncol = n_sig)
+  filt <- raw_df[rowSums(miss_ok) >= 1, ]
+  cat(sprintf("%s — after missingness filter (<%d zeros in >= 1 signal): %d of %d retained\n",
+              source_tag, max_zeros_allowed, nrow(filt), nrow(raw_df)))
+  
+  # Filter 2: Abundance
+  abun_ok <- sapply(signal_cols_list, function(cols)
+    rowMeans(filt[, cols, drop = FALSE], na.rm = TRUE) >= abundance_threshold)
+  if (is.null(dim(abun_ok))) abun_ok <- matrix(abun_ok, ncol = n_sig)
+  filt <- filt[rowSums(abun_ok) >= 1, ]
+  cat(sprintf("%s — after abundance filter (>= %s in >= 1 signal): %d retained\n",
+              source_tag, format(abundance_threshold, big.mark = ","), nrow(filt)))
+  
+  # Filter 3: Fold change
+  fc_ok <- sapply(signal_cols_list, function(sig_cols) {
+    mean_sig <- rowMeans(filt[, sig_cols, drop = FALSE], na.rm = TRUE)
+    max_bl   <- max_blank_mean(filt, blank_groups)
+    ((mean_sig + 1) / (max_bl + 1)) >= fold_change_threshold
+  })
+  if (is.null(dim(fc_ok))) fc_ok <- matrix(fc_ok, ncol = n_sig)
+  filt <- filt[rowSums(fc_ok) >= 1, ]
+  cat(sprintf("%s — after fold-change filter (>= %.1f in >= 1 signal): %d retained\n",
+              source_tag, fold_change_threshold, nrow(filt)))
+  
+  # Per-signal CoV
+  cov_col_names <- character(n_sig)
+  for (s in signal_samples) {
+    cols    <- sample_cols_list[[s]]
+    mean_s  <- rowMeans(filt[, cols, drop = FALSE], na.rm = TRUE)
+    sd_s    <- apply(   filt[, cols, drop = FALSE], 1, sd, na.rm = TRUE)
+    cov_col <- paste0("CoV_pct_", s)
+    cov_col_names[match(s, signal_samples)] <- cov_col
+    filt[[paste0("mean_", s)]] <- mean_s
+    filt[[cov_col]]            <- (sd_s / mean_s) * 100
+  }
+  cat("\n")
+  for (s in signal_samples)
+    print_cov_summary(filt[[paste0("CoV_pct_", s)]],
+                      paste(source_tag, s), cov_green, cov_yellow)
+  
+  if (cov_filter_remove) {
+    n_before <- nrow(filt)
+    cov_fail <- rowSums(sapply(cov_col_names, function(cn)
+      !is.na(filt[[cn]]) & filt[[cn]] >= cov_green)) == n_sig
+    filt <- filt[!cov_fail, ]
+    cat(sprintf("%s — after CoV filter (>= 1 signal < %.0f%%): %d of %d retained\n",
+                source_tag, cov_green, nrow(filt), n_before))
+  }
+  cat("\n")
+  
+  cov_meta <- setNames(
+    lapply(cov_col_names, function(cn) list(green = cov_green, yellow = cov_yellow)),
+    cov_col_names)
+  write_xlsx_cov(filt, file_filtered, cov_meta)
+  
+  matched_raw <- match_lmsd(filt, lmsd, adduct_cols, adduct_labels, ppm_threshold, source_tag)
+  matched     <- collapse_to_sum_composition(matched_raw)
+  cat(sprintf("%s — LMSD-matched rows (before collapse): %d\n", source_tag, nrow(matched_raw)))
+  cat(sprintf("%s — after sum-composition collapse:      %d\n\n", source_tag, nrow(matched)))
+  write_xlsx_cov(matched, file_matched, cov_meta)
+  
+  list(filt = filt, matched = matched, cov_meta = cov_meta,
+       sample_cols = sample_cols_list)
+}
+
+# ---------------------------------------------------------------------------
+# Generic FAIMS pipeline — shared for endogenous and IS
+# ---------------------------------------------------------------------------
+run_faims_pipeline <- function(raw_df,
+                               signal_by_CV,
+                               blank_by_CV,
+                               sample_cols,
+                               signal_samples,
+                               abundance_threshold,
+                               fold_change_threshold,
+                               max_zeros_allowed,
+                               cov_green, cov_yellow,
+                               cov_filter_remove,
+                               lmsd_ref, adduct_cols, adduct_labels,
+                               ppm_threshold,
+                               source_tag,
+                               file_filtered, file_matched) {
+  
+  n_sig  <- length(signal_samples)
+  n_cond <- length(cv_labels)
+  
+  # Filter 1: Missingness
+  miss_ok <- sapply(signal_by_CV, function(sig_cv_list) {
+    cv_pass <- sapply(sig_cv_list, function(cols)
+      count_zeros(raw_df, cols) < max_zeros_allowed)
+    if (is.null(dim(cv_pass))) cv_pass <- matrix(cv_pass, ncol = n_cond)
+    rowSums(cv_pass) >= 1
+  })
+  if (is.null(dim(miss_ok))) miss_ok <- matrix(miss_ok, ncol = n_sig)
+  filt <- raw_df[rowSums(miss_ok) >= 1, ]
+  cat(sprintf("%s — after missingness filter: %d of %d retained\n",
+              source_tag, nrow(filt), nrow(raw_df)))
+  
+  # Filter 2: Abundance
+  abun_ok <- sapply(signal_by_CV, function(sig_cv_list) {
+    cv_pass <- sapply(sig_cv_list, function(cols)
+      rowMeans(filt[, cols, drop = FALSE], na.rm = TRUE) >= abundance_threshold)
+    if (is.null(dim(cv_pass))) cv_pass <- matrix(cv_pass, ncol = n_cond)
+    rowSums(cv_pass) >= 1
+  })
+  if (is.null(dim(abun_ok))) abun_ok <- matrix(abun_ok, ncol = n_sig)
+  filt <- filt[rowSums(abun_ok) >= 1, ]
+  cat(sprintf("%s — after abundance filter: %d retained\n", source_tag, nrow(filt)))
+  
+  # Filter 3: FC (CV-matched signal vs CV-matched blank)
+  fc_ok <- sapply(signal_by_CV, function(sig_cv_list) {
+    cv_pass <- sapply(seq_along(cv_labels), function(i) {
+      mean_sig       <- rowMeans(filt[, sig_cv_list[[i]], drop = FALSE], na.rm = TRUE)
+      blank_groups_i <- lapply(blank_by_CV, `[[`, i)
+      max_bl         <- max_blank_mean(filt, blank_groups_i)
+      ((mean_sig + 1) / (max_bl + 1)) >= fold_change_threshold
+    })
+    if (is.null(dim(cv_pass))) cv_pass <- matrix(cv_pass, ncol = n_cond)
+    rowSums(cv_pass) >= 1
+  })
+  if (is.null(dim(fc_ok))) fc_ok <- matrix(fc_ok, ncol = n_sig)
+  filt <- filt[rowSums(fc_ok) >= 1, ]
+  cat(sprintf("%s — after fold-change filter: %d retained\n\n", source_tag, nrow(filt)))
+  
+  # Per-signal, per-CV CoV
+  cov_cols_out  <- setNames(vector("list", n_sig), signal_samples)
+  faims_cv_pass <- setNames(vector("list", n_sig), signal_samples)
+  
+  for (s in signal_samples) {
+    sig_cv_list     <- signal_by_CV[[s]]
+    cov_col_names_s <- character(n_cond)
+    cv_pass_s       <- matrix(FALSE, nrow = nrow(filt), ncol = n_cond)
+    for (i in seq_along(cv_labels)) {
+      cols     <- sig_cv_list[[i]]
+      mean_s   <- rowMeans(filt[, cols, drop = FALSE], na.rm = TRUE)
+      sd_s     <- apply(   filt[, cols, drop = FALSE], 1, sd, na.rm = TRUE)
+      mean_col <- paste0("mean_", s, "_", cv_labels[i])
+      cov_col  <- paste0("CoV_pct_", s, "_", cv_labels[i])
+      cov_col_names_s[i] <- cov_col
+      filt[[mean_col]] <- mean_s
+      filt[[cov_col]]  <- (sd_s / mean_s) * 100
+      abun_pass_i    <- mean_s >= abundance_threshold
+      blank_groups_i <- lapply(blank_by_CV, `[[`, i)
+      max_bl_i       <- max_blank_mean(filt, blank_groups_i)
+      fc_pass_i      <- ((mean_s + 1) / (max_bl_i + 1)) >= fold_change_threshold
+      cov_pass_i     <- if (cov_filter_remove)
+        (filt[[cov_col]] < cov_green) else rep(TRUE, nrow(filt))
+      cv_pass_s[, i] <- abun_pass_i & fc_pass_i & cov_pass_i
+      v <- filt[[cov_col]]
+      cat(sprintf("%s CoV %s %s:  <%.0f%%: %d | %.0f-%.0f%%: %d | >%.0f%%: %d\n",
+                  source_tag, s, cv_labels[i],
+                  cov_green,  sum(v <  cov_green,  na.rm = TRUE),
+                  cov_green,  cov_yellow,
+                  sum(v >= cov_green & v <= cov_yellow, na.rm = TRUE),
+                  cov_yellow, sum(v >  cov_yellow, na.rm = TRUE)))
+    }
+    cov_cols_out[[s]]  <- cov_col_names_s
+    faims_cv_pass[[s]] <- cv_pass_s
+  }
+  
+  all_cov_cols <- unlist(cov_cols_out)
+  if (cov_filter_remove) {
+    n_before <- nrow(filt)
+    cov_fail <- rowSums(sapply(all_cov_cols, function(cn)
+      !is.na(filt[[cn]]) & filt[[cn]] >= cov_green)) == length(all_cov_cols)
+    filt <- filt[!cov_fail, ]
+    for (s in signal_samples)
+      faims_cv_pass[[s]] <- faims_cv_pass[[s]][!cov_fail, ]
+    cat(sprintf("\n%s — after CoV filter: %d of %d retained\n", source_tag, nrow(filt), n_before))
+  }
+  cat("\n")
+  
+  cov_meta <- setNames(
+    lapply(all_cov_cols, function(cn) list(green = cov_green, yellow = cov_yellow)),
+    all_cov_cols)
+  write_xlsx_cov(filt, file_filtered, cov_meta)
+  
+  matched_raw <- match_lmsd(filt, lmsd_ref, adduct_cols, adduct_labels,
+                            ppm_threshold, source_tag)
+  
+  if (nrow(matched_raw) > 0) {
+    faims_filt_mz <- filt$mz
+    passing_cvs_col <- vapply(seq_len(nrow(matched_raw)), function(i) {
+      mz_i     <- matched_raw$mz[i]
+      filt_idx <- which(faims_filt_mz == mz_i)
+      if (length(filt_idx) == 0) return(NA_character_)
+      filt_idx <- filt_idx[1]
+      cvs_pass <- character(0)
+      for (s in signal_samples) {
+        pass_row <- faims_cv_pass[[s]][filt_idx, ]
+        cvs_pass <- union(cvs_pass, cv_labels[pass_row])
+      }
+      if (length(cvs_pass) == 0) NA_character_ else paste(sort(cvs_pass), collapse = ", ")
+    }, character(1))
+    matched_raw$passing_CVs <- passing_cvs_col
+    matched_raw <- matched_raw[!is.na(matched_raw$passing_CVs), ]
+  } else {
+    matched_raw$passing_CVs <- character(0)
+  }
+  
+  matched <- collapse_to_sum_composition(matched_raw)
+  cat(sprintf("%s — matched rows (before collapse): %d\n", source_tag, nrow(matched_raw)))
+  cat(sprintf("%s — after sum-composition collapse: %d\n\n", source_tag, nrow(matched)))
+  write_xlsx_cov(matched, file_matched, cov_meta)
+  
+  list(filt = filt, matched = matched, cov_meta = cov_meta,
+       cov_cols = cov_cols_out, faims_cv_pass = faims_cv_pass)
+}
+
+safe_name <- function(x) gsub("[^A-Za-z0-9._-]+", "_", x)
+
+# =============================================================================
+# 6. LOAD REFERENCE FILES
+# =============================================================================
+
+cat("Loading LMSD reference...\n")
+ref_raw <- read_excel(file_lipid_ref)
+
+required_ref_cols <- c("Exact mass", "Common name", "Systematic name",
+                       "Sum composition synonym", "Category", "Main class",
+                       "Sub class", "LipidMaps ID", "KEGG ID", adduct_cols)
+missing_ref <- setdiff(required_ref_cols, colnames(ref_raw))
+if (length(missing_ref) > 0)
+  stop(paste("LMSD file missing columns:", paste(missing_ref, collapse = ", ")))
+
+adduct_ok <- rowSums(!is.na(ref_raw[, adduct_cols])) > 0
+lmsd <- ref_raw[adduct_ok, ]
+cat(sprintf("LMSD entries loaded: %d\n\n", nrow(lmsd)))
+
+if (has_IS_ref) {
+  cat("Loading IS reference...\n")
+  IS_ref_raw <- read_excel(file_IS_ref)
+  # IS reference format: two columns only — IS name and measured m/z for this mode.
+  # Column 1: IS name (any header); Column 2: m/z (any header).
+  # This is intentionally simpler than the LMSD format — no adduct columns needed.
+  if (ncol(IS_ref_raw) < 2) {
+    warning("IS reference must have at least 2 columns (name, m/z) — IS matching skipped.")
+    has_IS_ref <- FALSE
+  } else {
+    colnames(IS_ref_raw)[1:2] <- c("IS_name", "IS_mz")
+    IS_ref <- IS_ref_raw[!is.na(IS_ref_raw$IS_mz), ]
+    cat(sprintf("IS reference entries loaded: %d\n\n", nrow(IS_ref)))
+  }
+} else {
+  cat("IS reference not provided — IS matching will be skipped.\n\n")
+}
+
+# ---------------------------------------------------------------------------
+# IS-specific matching functions
+# match_IS()    : matches filtered data against the simple IS reference
+#                 (one m/z per IS, no adduct logic)
+# run_IS_di_pipeline() : full filter + match pipeline for DI/FAIMSoff IS
+# run_IS_faims_pipeline() : full filter + match pipeline for FAIMS IS
+# ---------------------------------------------------------------------------
+
+match_IS <- function(filt_df, IS_ref, ppm_thresh, source_tag) {
+  # Loop over IS entries (small: ~10 compounds), vectorise ppm calculation
+  # across all filt_df rows at once — far faster than looping over filt rows.
+  result <- lapply(seq_len(nrow(IS_ref)), function(h) {
+    theo       <- IS_ref$IS_mz[h]
+    ppm_errors <- ((filt_df$mz - theo) / theo) * 1e6
+    idx        <- which(abs(ppm_errors) <= ppm_thresh & !is.na(ppm_errors))
+    if (length(idx) == 0L) return(NULL)
+    cbind(
+      data.frame(
+        is_label            = IS_ref$IS_name[h],
+        sum_composition_syn = IS_ref$IS_name[h],
+        common_name         = IS_ref$IS_name[h],
+        systematic_name     = NA_character_,
+        lmsd_id             = NA_character_,
+        theoretical_mz      = theo,
+        ppm_error           = round(ppm_errors[idx], 4),
+        source              = source_tag,
+        stringsAsFactors    = FALSE
+      ),
+      filt_df[idx, , drop = FALSE]
+    )
+  })
+  bind_rows(result)
+}
+
+run_IS_di_pipeline <- function(raw_df,
+                               sample_cols_list,
+                               signal_samples,
+                               blank_samples,
+                               abundance_threshold,
+                               fold_change_threshold,
+                               max_zeros_allowed,
+                               cov_green, cov_yellow,
+                               cov_filter_remove,
+                               IS_ref, ppm_threshold,
+                               source_tag,
+                               file_filtered, file_matched) {
+  signal_cols_list <- sample_cols_list[signal_samples]
+  blank_groups     <- sample_cols_list[blank_samples]
+  n_sig            <- length(signal_samples)
+  
+  miss_ok <- sapply(signal_cols_list, function(cols)
+    count_zeros(raw_df, cols) < max_zeros_allowed)
+  if (is.null(dim(miss_ok))) miss_ok <- matrix(miss_ok, ncol = n_sig)
+  filt <- raw_df[rowSums(miss_ok) >= 1, ]
+  cat(sprintf("%s — after missingness filter: %d of %d retained\n",
+              source_tag, nrow(filt), nrow(raw_df)))
+  
+  abun_ok <- sapply(signal_cols_list, function(cols)
+    rowMeans(filt[, cols, drop = FALSE], na.rm = TRUE) >= abundance_threshold)
+  if (is.null(dim(abun_ok))) abun_ok <- matrix(abun_ok, ncol = n_sig)
+  filt <- filt[rowSums(abun_ok) >= 1, ]
+  cat(sprintf("%s — after abundance filter: %d retained\n", source_tag, nrow(filt)))
+  
+  fc_ok <- sapply(signal_cols_list, function(sig_cols) {
+    mean_sig <- rowMeans(filt[, sig_cols, drop = FALSE], na.rm = TRUE)
+    max_bl   <- max_blank_mean(filt, blank_groups)
+    ((mean_sig + 1) / (max_bl + 1)) >= fold_change_threshold
+  })
+  if (is.null(dim(fc_ok))) fc_ok <- matrix(fc_ok, ncol = n_sig)
+  filt <- filt[rowSums(fc_ok) >= 1, ]
+  cat(sprintf("%s — after fold-change filter: %d retained\n", source_tag, nrow(filt)))
+  
+  cov_col_names <- character(n_sig)
+  for (s in signal_samples) {
+    cols    <- sample_cols_list[[s]]
+    mean_s  <- rowMeans(filt[, cols, drop = FALSE], na.rm = TRUE)
+    sd_s    <- apply(   filt[, cols, drop = FALSE], 1, sd, na.rm = TRUE)
+    cov_col <- paste0("CoV_pct_", s)
+    cov_col_names[match(s, signal_samples)] <- cov_col
+    filt[[paste0("mean_", s)]] <- mean_s
+    filt[[cov_col]]            <- (sd_s / mean_s) * 100
+  }
+  for (s in signal_samples)
+    print_cov_summary(filt[[paste0("CoV_pct_", s)]],
+                      paste(source_tag, s), cov_green, cov_yellow)
+  
+  if (cov_filter_remove) {
+    n_before <- nrow(filt)
+    cov_fail <- rowSums(sapply(cov_col_names, function(cn)
+      !is.na(filt[[cn]]) & filt[[cn]] >= cov_green)) == n_sig
+    filt <- filt[!cov_fail, ]
+    cat(sprintf("%s — after CoV filter: %d of %d retained\n",
+                source_tag, nrow(filt), n_before))
+  }
+  cat("\n")
+  
+  cov_meta <- setNames(
+    lapply(cov_col_names, function(cn) list(green = cov_green, yellow = cov_yellow)),
+    cov_col_names)
+  
+  # Write filtered file: mz + mean + CoV summary only (drop raw replicates)
+  filt_summary_cols <- c("mz",
+                         grep("^mean_", colnames(filt), value = TRUE),
+                         cov_col_names)
+  filt_summary <- filt[, intersect(filt_summary_cols, colnames(filt)), drop = FALSE]
+  write_xlsx_cov(filt_summary, file_filtered, cov_meta)
+  
+  matched_raw <- match_IS(filt, IS_ref, ppm_threshold, source_tag)
+  
+  # Write matched file: IS metadata + mean + CoV only (drop raw replicate columns)
+  meta_cols   <- c("is_label", "sum_composition_syn", "common_name",
+                   "theoretical_mz", "ppm_error", "mz", "source")
+  mean_cols   <- grep("^mean_", colnames(matched_raw), value = TRUE)
+  cov_cols_mr <- grep("^CoV_pct_", colnames(matched_raw), value = TRUE)
+  keep_cols   <- intersect(c(meta_cols, mean_cols, cov_cols_mr), colnames(matched_raw))
+  matched_out <- matched_raw[, keep_cols, drop = FALSE]
+  cov_meta_mr <- setNames(
+    lapply(cov_cols_mr, function(cn) list(green = cov_green, yellow = cov_yellow)),
+    cov_cols_mr)
+  cat(sprintf("%s — IS-matched rows: %d\n\n", source_tag, nrow(matched_out)))
+  write_xlsx_cov(matched_out, file_matched, cov_meta_mr)
+  
+  list(filt = filt, matched = matched_raw)
+}
+
+run_IS_faims_pipeline <- function(raw_df,
+                                  signal_by_CV,
+                                  blank_by_CV,
+                                  signal_samples,
+                                  abundance_threshold,
+                                  fold_change_threshold,
+                                  max_zeros_allowed,
+                                  cov_green, cov_yellow,
+                                  cov_filter_remove,
+                                  IS_ref, ppm_threshold,
+                                  source_tag,
+                                  file_filtered, file_matched) {
+  n_sig  <- length(signal_samples)
+  n_cond <- length(cv_labels)
+  
+  miss_ok <- sapply(signal_by_CV, function(sig_cv_list) {
+    cv_pass <- sapply(sig_cv_list, function(cols)
+      count_zeros(raw_df, cols) < max_zeros_allowed)
+    if (is.null(dim(cv_pass))) cv_pass <- matrix(cv_pass, ncol = n_cond)
+    rowSums(cv_pass) >= 1
+  })
+  if (is.null(dim(miss_ok))) miss_ok <- matrix(miss_ok, ncol = n_sig)
+  filt <- raw_df[rowSums(miss_ok) >= 1, ]
+  cat(sprintf("%s — after missingness filter: %d of %d retained\n",
+              source_tag, nrow(filt), nrow(raw_df)))
+  
+  abun_ok <- sapply(signal_by_CV, function(sig_cv_list) {
+    cv_pass <- sapply(sig_cv_list, function(cols)
+      rowMeans(filt[, cols, drop = FALSE], na.rm = TRUE) >= abundance_threshold)
+    if (is.null(dim(cv_pass))) cv_pass <- matrix(cv_pass, ncol = n_cond)
+    rowSums(cv_pass) >= 1
+  })
+  if (is.null(dim(abun_ok))) abun_ok <- matrix(abun_ok, ncol = n_sig)
+  filt <- filt[rowSums(abun_ok) >= 1, ]
+  cat(sprintf("%s — after abundance filter: %d retained\n", source_tag, nrow(filt)))
+  
+  fc_ok <- sapply(signal_by_CV, function(sig_cv_list) {
+    cv_pass <- sapply(seq_along(cv_labels), function(i) {
+      mean_sig       <- rowMeans(filt[, sig_cv_list[[i]], drop = FALSE], na.rm = TRUE)
+      blank_groups_i <- lapply(blank_by_CV, `[[`, i)
+      max_bl         <- max_blank_mean(filt, blank_groups_i)
+      ((mean_sig + 1) / (max_bl + 1)) >= fold_change_threshold
+    })
+    if (is.null(dim(cv_pass))) cv_pass <- matrix(cv_pass, ncol = n_cond)
+    rowSums(cv_pass) >= 1
+  })
+  if (is.null(dim(fc_ok))) fc_ok <- matrix(fc_ok, ncol = n_sig)
+  filt <- filt[rowSums(fc_ok) >= 1, ]
+  cat(sprintf("%s — after fold-change filter: %d retained\n\n", source_tag, nrow(filt)))
+  
+  cov_cols_out  <- setNames(vector("list", n_sig), signal_samples)
+  faims_cv_pass <- setNames(vector("list", n_sig), signal_samples)
+  
+  for (s in signal_samples) {
+    sig_cv_list     <- signal_by_CV[[s]]
+    cov_col_names_s <- character(n_cond)
+    cv_pass_s       <- matrix(FALSE, nrow = nrow(filt), ncol = n_cond)
+    for (i in seq_along(cv_labels)) {
+      cols     <- sig_cv_list[[i]]
+      mean_s   <- rowMeans(filt[, cols, drop = FALSE], na.rm = TRUE)
+      sd_s     <- apply(   filt[, cols, drop = FALSE], 1, sd, na.rm = TRUE)
+      cov_col  <- paste0("CoV_pct_", s, "_", cv_labels[i])
+      cov_col_names_s[i] <- cov_col
+      filt[[paste0("mean_", s, "_", cv_labels[i])]] <- mean_s
+      filt[[cov_col]] <- (sd_s / mean_s) * 100
+      blank_groups_i <- lapply(blank_by_CV, `[[`, i)
+      max_bl_i       <- max_blank_mean(filt, blank_groups_i)
+      cov_pass_i     <- if (cov_filter_remove)
+        (filt[[cov_col]] < cov_green) else rep(TRUE, nrow(filt))
+      cv_pass_s[, i] <- (mean_s >= abundance_threshold) &
+        (((mean_s + 1) / (max_bl_i + 1)) >= fold_change_threshold) &
+        cov_pass_i
+    }
+    cov_cols_out[[s]]  <- cov_col_names_s
+    faims_cv_pass[[s]] <- cv_pass_s
+  }
+  
+  all_cov_cols <- unlist(cov_cols_out)
+  if (cov_filter_remove) {
+    n_before <- nrow(filt)
+    cov_fail <- rowSums(sapply(all_cov_cols, function(cn)
+      !is.na(filt[[cn]]) & filt[[cn]] >= cov_green)) == length(all_cov_cols)
+    filt <- filt[!cov_fail, ]
+    for (s in signal_samples)
+      faims_cv_pass[[s]] <- faims_cv_pass[[s]][!cov_fail, ]
+    cat(sprintf("%s — after CoV filter: %d of %d retained\n", source_tag, nrow(filt), n_before))
+  }
+  cat("\n")
+  
+  cov_meta <- setNames(
+    lapply(all_cov_cols, function(cn) list(green = cov_green, yellow = cov_yellow)),
+    all_cov_cols)
+  
+  # Write filtered file: keep only mz + mean + CoV columns (not raw replicates).
+  # The raw FAIMS IS filtered table has 130+ replicate columns — writing and
+  # CoV-colouring all of them row-by-row is the primary performance bottleneck.
+  filt_summary_cols <- c("mz",
+                         grep("^mean_", colnames(filt), value = TRUE),
+                         all_cov_cols)
+  filt_summary <- filt[, intersect(filt_summary_cols, colnames(filt)), drop = FALSE]
+  write_xlsx_cov(filt_summary, file_filtered, cov_meta)
+  
+  matched_raw <- match_IS(filt, IS_ref, ppm_threshold, source_tag)
+  
+  if (nrow(matched_raw) > 0) {
+    # Build a lookup: mz value -> first row index in filt (vectorised, no loop)
+    faims_filt_mz  <- filt$mz
+    mz_to_filt_idx <- match(matched_raw$mz, faims_filt_mz)  # NA if not found
+    
+    # For each matched row, union passing CVs across all signal samples
+    # using pre-indexed faims_cv_pass matrices — no per-row which() calls
+    passing_cvs_col <- vapply(seq_len(nrow(matched_raw)), function(i) {
+      fi <- mz_to_filt_idx[i]
+      if (is.na(fi)) return(NA_character_)
+      cvs_pass <- logical(length(cv_labels))
+      for (s in signal_samples)
+        cvs_pass <- cvs_pass | faims_cv_pass[[s]][fi, ]
+      if (!any(cvs_pass)) NA_character_ else
+        paste(sort(cv_labels[cvs_pass]), collapse = ", ")
+    }, character(1))
+    matched_raw$passing_CVs <- passing_cvs_col
+    matched_raw <- matched_raw[!is.na(matched_raw$passing_CVs), ]
+  } else {
+    matched_raw$passing_CVs <- character(0)
+  }
+  
+  # Write matched file: keep IS metadata + passing_CVs + mean + CoV columns only.
+  # Raw replicate columns from filt are attached by match_IS via cbind — drop them.
+  meta_cols   <- c("is_label", "sum_composition_syn", "common_name",
+                   "theoretical_mz", "ppm_error", "mz", "source", "passing_CVs")
+  mean_cols   <- grep("^mean_", colnames(matched_raw), value = TRUE)
+  cov_cols_mr <- grep("^CoV_pct_", colnames(matched_raw), value = TRUE)
+  keep_cols   <- intersect(c(meta_cols, mean_cols, cov_cols_mr), colnames(matched_raw))
+  matched_out <- matched_raw[, keep_cols, drop = FALSE]
+  cov_meta_mr <- setNames(
+    lapply(cov_cols_mr, function(cn) list(green = cov_green, yellow = cov_yellow)),
+    cov_cols_mr)
+  cat(sprintf("%s — IS-matched rows: %d\n\n", source_tag, nrow(matched_out)))
+  write_xlsx_cov(matched_out, file_matched, cov_meta_mr)
+  
+  list(filt = filt, matched = matched_raw,
+       cov_cols = cov_cols_out, faims_cv_pass = faims_cv_pass)
+}
+
+# =============================================================================
+# 7. DI PIPELINE  (endogenous + IS)
+# =============================================================================
+
+DI_raw <- read_excel(file_DI)
+DI_sample_cols <- lapply(sample_names, function(s)
+  paste0(s, "_", seq_len(n_replicates)))
+names(DI_sample_cols) <- sample_names
+colnames(DI_raw) <- c("mz", unlist(DI_sample_cols))
+
+cat("--- DI endogenous pipeline ---\n")
+DI_res <- run_di_style_pipeline(
+  raw_df                = DI_raw,
+  sample_cols_list      = DI_sample_cols,
+  signal_samples        = signal_samples,
+  blank_samples         = blank_samples,
+  n_replicates          = n_replicates,
+  abundance_threshold   = abundance_threshold_DI,
+  fold_change_threshold = fold_change_threshold,
+  max_zeros_allowed     = max_zeros_allowed,
+  cov_green             = cov_green_DI,
+  cov_yellow            = cov_yellow_DI,
+  cov_filter_remove     = cov_filter_remove_DI,
+  lmsd                  = lmsd,
+  adduct_cols           = adduct_cols,
+  adduct_labels         = adduct_labels,
+  ppm_threshold         = ppm_threshold,
+  source_tag            = "DI",
+  file_filtered         = sub("\\.xlsx$", "_DI_filtered.xlsx",  file_output),
+  file_matched          = sub("\\.xlsx$", "_DI_matched.xlsx",   file_output)
+)
+DI_matched     <- DI_res$matched
+DI_sample_cols <- DI_res$sample_cols
+
+if (has_IS_ref) {
+  cat("--- DI IS pipeline ---\n")
+  DI_IS_res <- run_IS_di_pipeline(
+    raw_df                = DI_raw,
+    sample_cols_list      = DI_sample_cols,
+    signal_samples        = is_signal_samples,
+    blank_samples         = is_blank_samples,
+    abundance_threshold   = abundance_threshold_DI,
+    fold_change_threshold = fold_change_threshold_IS,
+    max_zeros_allowed     = max_zeros_allowed,
+    cov_green             = cov_green_DI,
+    cov_yellow            = cov_yellow_DI,
+    cov_filter_remove     = cov_filter_remove_DI,
+    IS_ref                = IS_ref,
+    ppm_threshold         = ppm_threshold,
+    source_tag            = "DI_IS",
+    file_filtered         = sub("\\.xlsx$", "_DI_IS_filtered.xlsx", file_output),
+    file_matched          = sub("\\.xlsx$", "_DI_IS_matched.xlsx",  file_output)
+  )
+  DI_IS_matched <- DI_IS_res$matched
+}
+
+# =============================================================================
+# 8. FAIMSoff PIPELINE  (endogenous + IS)
+# =============================================================================
+
+if (has_FAIMSoff) {
+  cat("--- FAIMSoff endogenous pipeline ---\n")
+  FAIMSoff_raw <- read_excel(file_FAIMSoff)
+  FAIMSoff_sample_cols <- lapply(sample_names, function(s)
+    paste0(s, "_", seq_len(n_replicates)))
+  names(FAIMSoff_sample_cols) <- sample_names
+  colnames(FAIMSoff_raw) <- c("mz", unlist(FAIMSoff_sample_cols))
+  
+  FAIMSoff_res <- run_di_style_pipeline(
+    raw_df                = FAIMSoff_raw,
+    sample_cols_list      = FAIMSoff_sample_cols,
+    signal_samples        = signal_samples,
+    blank_samples         = blank_samples,
+    n_replicates          = n_replicates,
+    abundance_threshold   = abundance_threshold_FAIMSoff,
+    fold_change_threshold = fold_change_threshold,
+    max_zeros_allowed     = max_zeros_allowed,
+    cov_green             = cov_green_FAIMSoff,
+    cov_yellow            = cov_yellow_FAIMSoff,
+    cov_filter_remove     = cov_filter_remove_FAIMSoff,
+    lmsd                  = lmsd,
+    adduct_cols           = adduct_cols,
+    adduct_labels         = adduct_labels,
+    ppm_threshold         = ppm_threshold,
+    source_tag            = "FAIMSoff",
+    file_filtered         = sub("\\.xlsx$", "_FAIMSoff_filtered.xlsx", file_output),
+    file_matched          = sub("\\.xlsx$", "_FAIMSoff_matched.xlsx",  file_output)
+  )
+  FAIMSoff_matched     <- FAIMSoff_res$matched
+  FAIMSoff_sample_cols <- FAIMSoff_res$sample_cols
+  
+  if (has_IS_ref) {
+    cat("--- FAIMSoff IS pipeline ---\n")
+    FAIMSoff_IS_res <- run_IS_di_pipeline(
+      raw_df                = FAIMSoff_raw,
+      sample_cols_list      = FAIMSoff_sample_cols,
+      signal_samples        = is_signal_samples,
+      blank_samples         = is_blank_samples,
+      abundance_threshold   = abundance_threshold_FAIMSoff,
+      fold_change_threshold = fold_change_threshold_IS,
+      max_zeros_allowed     = max_zeros_allowed,
+      cov_green             = cov_green_FAIMSoff,
+      cov_yellow            = cov_yellow_FAIMSoff,
+      cov_filter_remove     = cov_filter_remove_FAIMSoff,
+      IS_ref                = IS_ref,
+      ppm_threshold         = ppm_threshold,
+      source_tag            = "FAIMSoff_IS",
+      file_filtered         = sub("\\.xlsx$", "_FAIMSoff_IS_filtered.xlsx", file_output),
+      file_matched          = sub("\\.xlsx$", "_FAIMSoff_IS_matched.xlsx",  file_output)
+    )
+    FAIMSoff_IS_matched <- FAIMSoff_IS_res$matched
+  }
+  
+} else {
+  FAIMSoff_matched     <- NULL
+  FAIMSoff_sample_cols <- NULL
+  FAIMSoff_IS_matched  <- NULL
+  cat("FAIMSoff: not provided, skipping.\n\n")
+}
+
+# =============================================================================
+# 9. FAIMS PIPELINE  (endogenous + IS)
+# =============================================================================
+
+FAIMS_raw <- read_excel(file_FAIMS)
+
+make_cols_faims <- function(sample, cv_labels, n_rep) {
+  paste0(sample, "_", rep(cv_labels, each = n_rep),
+         "_rep", rep(seq_len(n_rep), times = length(cv_labels)))
+}
+
+FAIMS_sample_cols <- lapply(sample_names, make_cols_faims,
+                            cv_labels = cv_labels, n_rep = n_replicates)
+names(FAIMS_sample_cols) <- sample_names
+colnames(FAIMS_raw) <- c("mz", unlist(FAIMS_sample_cols))
+
+by_CV <- function(sample) {
+  lapply(cv_labels, function(cv)
+    paste0(sample, "_", cv, "_rep", seq_len(n_replicates)))
+}
+
+signal_by_CV_list    <- lapply(signal_samples,    by_CV)
+names(signal_by_CV_list)    <- signal_samples
+IS_signal_by_CV_list <- lapply(is_signal_samples, by_CV)
+names(IS_signal_by_CV_list) <- is_signal_samples
+
+blank_by_CV    <- lapply(blank_samples,    by_CV)
+IS_blank_by_CV <- lapply(is_blank_samples, by_CV)
+
+cat("--- FAIMS endogenous pipeline ---\n")
+FAIMS_res <- run_faims_pipeline(
+  raw_df                = FAIMS_raw,
+  signal_by_CV          = signal_by_CV_list,
+  blank_by_CV           = blank_by_CV,
+  sample_cols           = FAIMS_sample_cols,
+  signal_samples        = signal_samples,
+  abundance_threshold   = abundance_threshold_FAIMS,
+  fold_change_threshold = fold_change_threshold,
+  max_zeros_allowed     = max_zeros_allowed,
+  cov_green             = cov_green_FAIMS,
+  cov_yellow            = cov_yellow_FAIMS,
+  cov_filter_remove     = cov_filter_remove_FAIMS,
+  lmsd_ref              = lmsd,
+  adduct_cols           = adduct_cols,
+  adduct_labels         = adduct_labels,
+  ppm_threshold         = ppm_threshold,
+  source_tag            = "FAIMS",
+  file_filtered         = sub("\\.xlsx$", "_FAIMS_filtered.xlsx", file_output),
+  file_matched          = sub("\\.xlsx$", "_FAIMS_matched.xlsx",  file_output)
+)
+FAIMS_matched  <- FAIMS_res$matched
+cov_cols_FAIMS <- FAIMS_res$cov_cols
+faims_cv_pass  <- FAIMS_res$faims_cv_pass
+FAIMS_filt     <- FAIMS_res$filt
+
+if (has_IS_ref) {
+  cat("--- FAIMS IS pipeline ---\n")
+  FAIMS_IS_res <- run_IS_faims_pipeline(
+    raw_df                = FAIMS_raw,
+    signal_by_CV          = IS_signal_by_CV_list,
+    blank_by_CV           = IS_blank_by_CV,
+    signal_samples        = is_signal_samples,
+    abundance_threshold   = abundance_threshold_FAIMS,
+    fold_change_threshold = fold_change_threshold_IS,
+    max_zeros_allowed     = max_zeros_allowed,
+    cov_green             = cov_green_FAIMS,
+    cov_yellow            = cov_yellow_FAIMS,
+    cov_filter_remove     = cov_filter_remove_FAIMS,
+    IS_ref                = IS_ref,
+    ppm_threshold         = ppm_threshold,
+    source_tag            = "FAIMS_IS",
+    file_filtered         = sub("\\.xlsx$", "_FAIMS_IS_filtered.xlsx", file_output),
+    file_matched          = sub("\\.xlsx$", "_FAIMS_IS_matched.xlsx",  file_output)
+  )
+  FAIMS_IS_matched <- FAIMS_IS_res$matched
+}
+
+# =============================================================================
+# 10. COMBINED ENDOGENOUS OUTPUT
+# =============================================================================
+
+DI_uniq       <- DI_matched[!duplicated(DI_matched$group_key), ]
+FAIMS_uniq    <- FAIMS_matched[!duplicated(FAIMS_matched$group_key), ]
+FAIMSoff_uniq <- if (has_FAIMSoff)
+  FAIMSoff_matched[!duplicated(FAIMSoff_matched$group_key), ] else
+    data.frame(group_key = character(0), stringsAsFactors = FALSE)
+
+all_keys <- Reduce(union, list(DI_uniq$group_key,
+                               FAIMSoff_uniq$group_key,
+                               FAIMS_uniq$group_key))
+
+combined <- lapply(all_keys, function(key) {
+  di_row    <- DI_uniq[DI_uniq$group_key == key, ]
+  fo_row    <- FAIMSoff_uniq[FAIMSoff_uniq$group_key == key, ]
+  faims_row <- FAIMS_uniq[FAIMS_uniq$group_key == key, ]
+  
+  in_DI       <- nrow(di_row)    > 0
+  in_FAIMSoff <- nrow(fo_row)    > 0
+  in_FAIMS    <- nrow(faims_row) > 0
+  
+  src_tags  <- c(if (in_DI) "DI", if (in_FAIMSoff) "FAIMSoff", if (in_FAIMS) "FAIMS")
+  detection <- if (length(src_tags) > 1) paste(src_tags, collapse = " + ") else
+    paste(src_tags, "only")
+  
+  src <- if (in_DI) di_row else if (in_FAIMSoff) fo_row else faims_row
+  
+  faims_cvs <- NA_character_
+  if (in_FAIMS) {
+    cvs <- unique(unlist(strsplit(
+      faims_row$passing_CVs[!is.na(faims_row$passing_CVs)], ",\\s*")))
+    faims_cvs <- if (length(cvs) > 0) paste(sort(cvs), collapse = ", ") else NA_character_
+  }
+  
+  mz_DI        <- if (in_DI)       di_row$mz[1]          else NA_real_
+  mz_FAIMSoff  <- if (in_FAIMSoff) fo_row$mz[1]          else NA_real_
+  mz_FAIMS     <- if (in_FAIMS)    faims_row$mz[1]        else NA_real_
+  ppm_DI       <- if (in_DI)       di_row$ppm_error[1]   else NA_real_
+  ppm_FAIMSoff <- if (in_FAIMSoff) fo_row$ppm_error[1]   else NA_real_
+  ppm_FAIMS    <- if (in_FAIMS)    faims_row$ppm_error[1] else NA_real_
+  
+  di_rep_list  <- list()
+  di_mean_list <- list()
+  for (s in signal_samples) {
+    cols <- DI_sample_cols[[s]]
+    vals <- if (in_DI)
+      as.numeric(di_row[1, intersect(cols, colnames(di_row))])
+    else rep(NA_real_, n_replicates)
+    di_rep_list  <- c(di_rep_list,
+                      setNames(as.list(vals), paste0(s, "_DI_rep", seq_len(n_replicates))))
+    di_mean_list <- c(di_mean_list,
+                      setNames(list(round(mean(vals, na.rm = TRUE), 1)),
+                               paste0("mean_", s, "_DI")))
+  }
+  
+  fo_rep_list  <- list()
+  fo_mean_list <- list()
+  if (has_FAIMSoff) {
+    for (s in signal_samples) {
+      cols <- FAIMSoff_sample_cols[[s]]
+      vals <- if (in_FAIMSoff)
+        as.numeric(fo_row[1, intersect(cols, colnames(fo_row))])
+      else rep(NA_real_, n_replicates)
+      fo_rep_list  <- c(fo_rep_list,
+                        setNames(as.list(vals),
+                                 paste0(s, "_FAIMSoff_rep", seq_len(n_replicates))))
+      fo_mean_list <- c(fo_mean_list,
+                        setNames(list(round(mean(vals, na.rm = TRUE), 1)),
+                                 paste0("mean_", s, "_FAIMSoff")))
+    }
+  }
+  
+  faims_rep_list  <- list()
+  faims_mean_list <- list()
+  for (s in signal_samples) {
+    sig_cv_list <- signal_by_CV_list[[s]]
+    for (i in seq_along(cv_labels)) {
+      cols <- sig_cv_list[[i]]
+      vals <- if (in_FAIMS)
+        as.numeric(faims_row[1, intersect(cols, colnames(faims_row))])
+      else rep(NA_real_, n_replicates)
+      faims_rep_list  <- c(faims_rep_list,
+                           setNames(as.list(vals),
+                                    paste0(s, "_FAIMS_", cv_labels[i], "_rep", seq_len(n_replicates))))
+      faims_mean_list <- c(faims_mean_list,
+                           setNames(list(round(mean(vals, na.rm = TRUE), 1)),
+                                    paste0("mean_", s, "_FAIMS_", cv_labels[i])))
+    }
+  }
+  
+  row_out <- c(
+    list(
+      sum_composition_syn = src$sum_composition_syn[1],
+      lmsd_ids            = src$lmsd_id[1],
+      common_names        = src$common_name[1],
+      systematic_names    = src$systematic_name[1],
+      category            = src$category[1],
+      main_class          = src$main_class[1],
+      sub_class           = src$sub_class[1],
+      kegg_ids            = src$kegg_id[1],
+      adduct              = src$adduct[1],
+      theoretical_mz      = src$theoretical_mz[1],
+      exact_mass          = lmsd$`Exact mass`[match(
+        strsplit(src$lmsd_id[1], "; ")[[1]][1], lmsd$`LipidMaps ID`)][1],
+      detection           = detection,
+      FAIMS_CVs           = faims_cvs,
+      mz_DI               = mz_DI,
+      ppm_DI              = ppm_DI,
+      mz_FAIMSoff         = mz_FAIMSoff,
+      ppm_FAIMSoff        = ppm_FAIMSoff,
+      mz_FAIMS            = mz_FAIMS,
+      ppm_FAIMS           = ppm_FAIMS
+    ),
+    di_rep_list, fo_rep_list, faims_rep_list,
+    di_mean_list, fo_mean_list, faims_mean_list
+  )
+  as.data.frame(row_out, stringsAsFactors = FALSE)
+})
+
+combined_df <- bind_rows(combined) %>% arrange(theoretical_mz)
+
+cat("Combined output:", nrow(combined_df), "rows\n")
+for (det in sort(unique(combined_df$detection)))
+  cat(sprintf("  %-30s: %d\n", det, sum(combined_df$detection == det)))
+cat("\n")
+
+# =============================================================================
+# 11a. WRITE COMBINED EXCEL
+# =============================================================================
+
+detection_colours <- c(
+  "DI + FAIMSoff + FAIMS" = "#C6EFCE",
+  "DI + FAIMS"            = "#9DC3E6",
+  "DI + FAIMSoff"         = "#A9D18E",
+  "FAIMSoff + FAIMS"      = "#D9B3FF",
+  "DI only"               = "#BDD7EE",
+  "FAIMSoff only"         = "#FFEB9C",
+  "FAIMS only"            = "#FFDAB9"
+)
+
+wb <- createWorkbook()
+addWorksheet(wb, "Combined")
+writeData(wb, "Combined", combined_df)
+
+hdr_style <- createStyle(
+  fontName = "Arial", fontSize = 11, fontColour = "#FFFFFF",
+  fgFill = "#2F5496", halign = "CENTER", valign = "CENTER",
+  wrapText = TRUE, textDecoration = "Bold"
+)
+addStyle(wb, "Combined", hdr_style,
+         rows = 1, cols = 1:ncol(combined_df), gridExpand = TRUE)
+
+for (i in seq_len(nrow(combined_df))) {
+  hex <- detection_colours[combined_df$detection[i]]
+  if (is.na(hex)) hex <- "#FFFFFF"
+  addStyle(wb, "Combined", createStyle(fgFill = hex),
+           rows = i + 1, cols = 1:ncol(combined_df),
+           gridExpand = TRUE, stack = TRUE)
+}
+
+mean_col_names <- c(
+  paste0("mean_", rep(signal_samples, each = 1), "_DI"),
+  if (has_FAIMSoff) paste0("mean_", rep(signal_samples, each = 1), "_FAIMSoff"),
+  paste0("mean_", rep(signal_samples, each = n_conditions), "_FAIMS_",
+         rep(cv_labels, times = n_signals))
+)
+mean_col_idx <- which(colnames(combined_df) %in% mean_col_names)
+if (length(mean_col_idx))
+  addStyle(wb, "Combined",
+           createStyle(fontName = "Arial", fontSize = 10,
+                       textDecoration = "Bold", numFmt = "0"),
+           rows = 2:(nrow(combined_df) + 1),
+           cols = mean_col_idx, gridExpand = TRUE, stack = TRUE)
+
+mz_style <- createStyle(numFmt = "0.00000")
+mz_cols  <- which(colnames(combined_df) %in%
+                    c("theoretical_mz", "exact_mass", "mz_DI", "mz_FAIMSoff", "mz_FAIMS"))
+if (length(mz_cols))
+  addStyle(wb, "Combined", mz_style, rows = 2:(nrow(combined_df) + 1),
+           cols = mz_cols, gridExpand = TRUE, stack = TRUE)
+
+fixed_widths <- c(22, 30, 50, 50, 28, 32, 36, 20, 10, 16, 14, 24, 30,
+                  14, 10, 14, 10, 14, 10)
+if (!has_FAIMSoff)
+  fixed_widths <- fixed_widths[!seq_along(fixed_widths) %in% c(16, 17)]
+
+n_fixed <- length(fixed_widths)
+n_data  <- ncol(combined_df) - n_fixed
+col_widths <- c(fixed_widths, rep(12, max(n_data, 0)))
+setColWidths(wb, "Combined", cols = seq_along(col_widths), widths = col_widths)
+
+addStyle(wb, "Combined", createStyle(valign = "top"),
+         rows = 2:(nrow(combined_df) + 1),
+         cols = 1:ncol(combined_df), gridExpand = TRUE, stack = TRUE)
+freezePane(wb, "Combined", firstRow = TRUE)
+
+addWorksheet(wb, "Legend")
+legend_rows <- data.frame(
+  Colour  = names(detection_colours),
+  Meaning = paste("Detected in:", gsub(" \\+", ",", names(detection_colours))),
+  stringsAsFactors = FALSE
+)
+writeData(wb, "Legend", legend_rows)
+for (i in seq_len(nrow(legend_rows))) {
+  addStyle(wb, "Legend", createStyle(fgFill = unname(detection_colours[i])),
+           rows = i + 1, cols = 1:2, gridExpand = TRUE)
+}
+setColWidths(wb, "Legend", cols = 1:2, widths = c(30, 50))
+
+saveWorkbook(wb, file_output, overwrite = TRUE)
+cat("Combined output written to:", file_output, "\n")
+
+# =============================================================================
+# 11b. VENN DIAGRAM — sum-composition hits: DI vs FAIMSoff vs FAIMS
+# =============================================================================
+
+if (generate_venn) {
+  if (!requireNamespace("VennDiagram", quietly = TRUE)) {
+    message("Package 'VennDiagram' not installed - Venn skipped. ",
+            "install.packages('VennDiagram')")
+  } else {
+    suppressPackageStartupMessages(library(VennDiagram)); library(grid)
+    if (requireNamespace("futile.logger", quietly = TRUE))
+      futile.logger::flog.threshold(futile.logger::ERROR, name = "VennDiagramLogger")
+    
+    venn_sets <- list(
+      DI       = unique(DI_uniq$group_key),
+      FAIMSoff = if (has_FAIMSoff) unique(FAIMSoff_uniq$group_key) else NULL,
+      FAIMS    = unique(FAIMS_uniq$group_key))
+    venn_sets <- venn_sets[!vapply(venn_sets, is.null, logical(1))]
+    
+    venn_cols <- c(DI = "#4472C4", FAIMSoff = "#70AD47", FAIMS = "#ED7D31")
+    fill_cols <- unname(venn_cols[names(venn_sets)])
+    
+    cat("\n========================================\n")
+    cat("Venn diagram (sum-composition hits)\n")
+    cat("========================================\n")
+    for (nm in names(venn_sets))
+      cat(sprintf("  %-10s: %d species\n", nm, length(venn_sets[[nm]])))
+    
+    venn_args <- list(
+      x = venn_sets, filename = NULL, fill = fill_cols, alpha = 0.45,
+      col = "grey30", lwd = 1.5, cex = 1.4, fontfamily = "sans",
+      cat.cex = 1.5, cat.fontface = "bold", cat.fontfamily = "sans",
+      main = sprintf("Sum-composition lipid hits (%s mode, \u00b1%g ppm)",
+                     toupper(mode), ppm_threshold),
+      main.cex = 1.6, margin = 0.08)
+    venn_grob <- tryCatch(
+      do.call(venn.diagram, c(venn_args, disable.logging = TRUE)),
+      error = function(e) do.call(venn.diagram, venn_args))
+    
+    venn_png <- sub("\\.xlsx$", "_venn_sumcomposition.png", file_output)
+    venn_pdf <- sub("\\.xlsx$", "_venn_sumcomposition.pdf", file_output)
+    png(venn_png, width = 2000, height = 2000, res = 300)
+    grid.newpage(); grid.draw(venn_grob); dev.off()
+    pdf(venn_pdf, width = 7, height = 7)
+    grid.newpage(); grid.draw(venn_grob); dev.off()
+    cat(sprintf("Venn diagram saved: %s\n", venn_png))
+    
+    # Companion membership table with readable labels
+    key_labels <- bind_rows(
+      DI_uniq[, c("group_key", "sum_composition_syn", "common_name")],
+      if (has_FAIMSoff) FAIMSoff_uniq[, c("group_key", "sum_composition_syn", "common_name")] else NULL,
+      FAIMS_uniq[, c("group_key", "sum_composition_syn", "common_name")])
+    key_labels <- key_labels[!duplicated(key_labels$group_key), ]
+    
+    all_keys_venn <- Reduce(union, venn_sets)
+    venn_membership <- data.frame(
+      group_key   = all_keys_venn,
+      in_DI       = all_keys_venn %in% venn_sets$DI,
+      in_FAIMSoff = if (has_FAIMSoff) all_keys_venn %in% venn_sets$FAIMSoff else FALSE,
+      in_FAIMS    = all_keys_venn %in% venn_sets$FAIMS,
+      stringsAsFactors = FALSE) %>%
+      left_join(key_labels, by = "group_key") %>%
+      mutate(detection = trimws(paste0(
+        ifelse(in_DI, "DI ", ""), ifelse(in_FAIMSoff, "FAIMSoff ", ""),
+        ifelse(in_FAIMS, "FAIMS", "")))) %>%
+      select(group_key, sum_composition_syn, common_name,
+             in_DI, in_FAIMSoff, in_FAIMS, detection)
+    write_xlsx_cov(venn_membership,
+                   sub("\\.xlsx$", "_venn_membership.xlsx", file_output))
+  }
+}
+
+# =============================================================================
+# 12. CATEGORY BAR PLOT (per signal sample)
+# =============================================================================
+
+if (generate_barplot) {
+  library(ggplot2)
+  
+  cat("\n========================================\n")
+  cat("Category bar plots (per signal sample)\n")
+  cat("========================================\n\n")
+  
+  barplot_label_fallback <- function(sum_comp, common_name, systematic_name, ids) {
+    sum_comp <- as.character(sum_comp); common_name <- as.character(common_name)
+    systematic_name <- as.character(systematic_name); ids <- as.character(ids)
+    is_blank <- function(x) is.na(x) | trimws(x) == ""
+    label <- sum_comp
+    use <- is_blank(label); label[use] <- common_name[use]
+    use <- is_blank(label); label[use] <- systematic_name[use]
+    use <- is_blank(label); label[use] <- ids[use]
+    label
+  }
+  
+  bar_df <- combined_df %>%
+    mutate(
+      lipid_label = barplot_label_fallback(sum_composition_syn, common_names,
+                                           systematic_names, lmsd_ids),
+      category    = if_else(is.na(category) | trimws(category) == "",
+                            "Uncategorized", category)
+    )
+  
+  all_cols_bar <- colnames(bar_df)
+  clean_cat    <- function(x) sub("\\s*\\[.*\\]$", "", x)
+  
+  instrument_levels  <- c("DI", "FAIMSoff", "FAIMS")
+  instrument_colours <- c("DI" = "#4472C4", "FAIMSoff" = "#70AD47", "FAIMS" = "#ED7D31")
+  
+  for (s in signal_samples) {
+    di_cols_s       <- grep(paste0("^", s, "_DI_rep[0-9]+$"),       all_cols_bar, value = TRUE)
+    faimsoff_cols_s <- grep(paste0("^", s, "_FAIMSoff_rep[0-9]+$"), all_cols_bar, value = TRUE)
+    faims_cols_s    <- grep(paste0("^", s, "_FAIMS_.*_rep[0-9]+$"), all_cols_bar, value = TRUE)
+    
+    if (length(di_cols_s) == 0 && length(faimsoff_cols_s) == 0 && length(faims_cols_s) == 0) {
+      cat(sprintf("  %s: no columns found — skipped\n", s)); next
+    }
+    
+    avail_df <- bar_df %>%
+      mutate(
+        .in_DI       = if (length(di_cols_s)       > 0) rowSums(!is.na(across(all_of(di_cols_s))))       > 0 else FALSE,
+        .in_FAIMSoff = if (length(faimsoff_cols_s) > 0) rowSums(!is.na(across(all_of(faimsoff_cols_s)))) > 0 else FALSE,
+        .in_FAIMS    = if (length(faims_cols_s)    > 0) rowSums(!is.na(across(all_of(faims_cols_s))))    > 0 else FALSE
+      ) %>%
+      group_by(lipid_label) %>%
+      summarise(
+        category    = sort(unique(category))[1],
+        in_DI       = any(.in_DI),
+        in_FAIMSoff = any(.in_FAIMSoff),
+        in_FAIMS    = any(.in_FAIMS),
+        .groups = "drop"
+      )
+    
+    plot_df <- avail_df %>%
+      pivot_longer(cols = c(in_DI, in_FAIMSoff, in_FAIMS),
+                   names_to = "instrument_flag", values_to = "present") %>%
+      filter(present) %>%
+      mutate(instrument = case_when(
+        instrument_flag == "in_DI"       ~ "DI",
+        instrument_flag == "in_FAIMSoff" ~ "FAIMSoff",
+        instrument_flag == "in_FAIMS"    ~ "FAIMS"
+      )) %>%
+      filter(!(instrument == "FAIMSoff" & !has_FAIMSoff)) %>%
+      distinct(lipid_label, category, instrument) %>%
+      count(category, instrument)
+    
+    if (nrow(plot_df) == 0) {
+      cat(sprintf("  %s: no matched lipids — bar plot skipped\n", s)); next
+    }
+    
+    cat_order <- plot_df %>%
+      group_by(category) %>%
+      summarise(total = sum(n), .groups = "drop") %>%
+      arrange(desc(total)) %>%
+      pull(category)
+    
+    p_cat <- ggplot(plot_df,
+                    aes(x = factor(clean_cat(category), levels = clean_cat(cat_order)),
+                        y = n,
+                        fill = factor(instrument, levels = instrument_levels))) +
+      geom_bar(stat = "identity", position = "dodge", width = 0.65, colour = "white") +
+      scale_fill_manual(values = instrument_colours, name = "Detection method") +
+      labs(
+        title    = sprintf("Lipid category distribution by detection method — %s", s),
+        subtitle = sprintf("%s mode | signal: %s | ppm: %g%s",
+                           toupper(mode), s, ppm_threshold,
+                           if (has_FAIMSoff) " | FAIMSoff included" else ""),
+        x = "Lipid category",
+        y = "Number of lipid entries (sum-composition level)"
+      ) +
+      theme_minimal(base_size = 13) +
+      theme(axis.text.x        = element_text(angle = 35, hjust = 1, size = 11),
+            plot.title         = element_text(face = "bold", size = 14),
+            legend.position    = "top",
+            panel.grid.major.x = element_blank())
+    
+    ggsave(sub("\\.xlsx$", sprintf("_category_barplot_%s.pdf", s), file_output),
+           p_cat, width = 10, height = 6, device = "pdf")
+    ggsave(sub("\\.xlsx$", sprintf("_category_barplot_%s.png", s), file_output),
+           p_cat, width = 10, height = 6, dpi = 300)
+    cat(sprintf("  %s: category bar plot saved\n", s))
+  }
+}
+
+# =============================================================================
+# 13. ENDOGENOUS HEATMAP / FAIMS-vs-DI TABLE SETUP
+# =============================================================================
+
+if (generate_heatmap || generate_heatmap_all_cv || generate_faims_di_table) {
+  
+  library(ggplot2)
+  
+  heatmap_colours <- c("#00008B","#0000FF","#4169E1","#87CEEB","#FFFFFF",
+                       "#FFB6C1","#FF4500","#FF0000","#8B0000")
+  
+  heat_label_fallback <- function(sum_comp, common_name, systematic_name, ids) {
+    sum_comp <- as.character(sum_comp); common_name <- as.character(common_name)
+    systematic_name <- as.character(systematic_name); ids <- as.character(ids)
+    is_blank <- function(x) is.na(x) | trimws(x) == ""
+    label <- sum_comp
+    use <- is_blank(label); label[use] <- common_name[use]
+    use <- is_blank(label); label[use] <- systematic_name[use]
+    use <- is_blank(label); label[use] <- ids[use]
+    label
+  }
+  
+  all_cols <- colnames(combined_df)
+  
+  sample_blocks <- lapply(signal_samples, function(s) {
+    di_cols <- grep(paste0("^", s, "_DI_rep[0-9]+$"), all_cols, value = TRUE)
+    di_cols <- di_cols[order(as.integer(sub(".*_rep", "", di_cols)))]
+    fo_cols <- grep(paste0("^", s, "_FAIMSoff_rep[0-9]+$"), all_cols, value = TRUE)
+    fo_cols <- fo_cols[order(as.integer(sub(".*_rep", "", fo_cols)))]
+    faims_cols_all <- grep(paste0("^", s, "_FAIMS_.*_rep[0-9]+$"), all_cols, value = TRUE)
+    cv_part <- sub(paste0("^", s, "_FAIMS_(.*)_rep[0-9]+$"), "\\1", faims_cols_all)
+    cv_num  <- as.numeric(gsub("[^0-9]", "", cv_part))
+    faims_cv_blocks <- lapply(sort(unique(cv_num)), function(n) {
+      cols <- faims_cols_all[cv_num == n]
+      cols[order(as.integer(sub(".*_rep", "", cols)))]
+    })
+    names(faims_cv_blocks) <- as.character(sort(unique(cv_num)))
+    list(sample = s, di_cols = di_cols, fo_cols = fo_cols,
+         faims_cv_blocks = faims_cv_blocks)
+  })
+  sample_blocks <- sample_blocks[sapply(sample_blocks, function(b)
+    length(b$di_cols) > 0 || length(b$fo_cols) > 0 || length(b$faims_cv_blocks) > 0)]
+  
+  rep_col_labels <- unlist(lapply(sample_blocks, function(b) {
+    out <- character(0)
+    if (length(b$di_cols) > 0)
+      out <- c(out, paste0(b$sample, "_DI_rep", seq_along(b$di_cols)))
+    if (length(b$fo_cols) > 0)
+      out <- c(out, paste0(b$sample, "_FAIMSoff_rep", seq_along(b$fo_cols)))
+    if (length(b$faims_cv_blocks) > 0)
+      out <- c(out, paste0(b$sample, "_FAIMS_bestCV_rep",
+                           seq_len(length(b$faims_cv_blocks[[1]]))))
+    out
+  }))
+  block_sizes <- unlist(lapply(sample_blocks, function(b) {
+    sizes <- c()
+    if (length(b$di_cols) > 0)          sizes <- c(sizes, length(b$di_cols))
+    if (length(b$fo_cols) > 0)          sizes <- c(sizes, length(b$fo_cols))
+    if (length(b$faims_cv_blocks) > 0)  sizes <- c(sizes, length(b$faims_cv_blocks[[1]]))
+    sizes
+  }))
+  
+  heat_df <- combined_df %>%
+    mutate(
+      lipid_label = heat_label_fallback(sum_composition_syn, common_names,
+                                        systematic_names, lmsd_ids),
+      category    = if_else(is.na(category) | trimws(category) == "",
+                            "Uncategorized", category)
+    )
+  
+  all_source_cols <- unlist(lapply(sample_blocks, function(b)
+    c(b$di_cols, b$fo_cols, unlist(b$faims_cv_blocks))))
+  all_source_cols <- intersect(all_source_cols, colnames(heat_df))
+  
+  heat_df_avail <- heat_df
+  for (b in sample_blocks) {
+    s         <- b$sample
+    di_cols_s <- intersect(b$di_cols, colnames(heat_df))
+    fo_cols_s <- intersect(b$fo_cols, colnames(heat_df))
+    faims_cols_s <- intersect(unlist(b$faims_cv_blocks), colnames(heat_df))
+    
+    heat_df_avail[[paste0(".avail_", s, "_DI")]] <-
+      if (length(di_cols_s) > 0) rowSums(!is.na(heat_df[di_cols_s])) > 0 else FALSE
+    heat_df_avail[[paste0(".avail_", s, "_FAIMSoff")]] <-
+      if (length(fo_cols_s) > 0) rowSums(!is.na(heat_df[fo_cols_s])) > 0 else FALSE
+    heat_df_avail[[paste0(".avail_", s, "_FAIMS")]] <-
+      if (length(faims_cols_s) > 0) {
+        rowSums(sapply(b$faims_cv_blocks, function(cv_cols) {
+          cv_cols <- intersect(cv_cols, colnames(heat_df))
+          if (length(cv_cols) == 0) return(rep(FALSE, nrow(heat_df)))
+          rowMeans(heat_df[cv_cols], na.rm = TRUE) >= abundance_threshold_FAIMS
+        })) > 0
+      } else FALSE
+    
+    for (cv_name in names(b$faims_cv_blocks)) {
+      cv_cols <- intersect(b$faims_cv_blocks[[cv_name]], colnames(heat_df))
+      heat_df_avail[[paste0(".avail_", s, "_FAIMS_", cv_name)]] <-
+        if (length(cv_cols) > 0)
+          rowMeans(heat_df[cv_cols], na.rm = TRUE) >= abundance_threshold_FAIMS
+      else FALSE
+    }
+  }
+  avail_cols <- grep("^\\.avail_", colnames(heat_df_avail), value = TRUE)
+  
+  heat_collapsed <- heat_df_avail %>%
+    mutate(across(all_of(all_source_cols), ~ ifelse(is.na(.x), 0, .x))) %>%
+    group_by(lipid_label) %>%
+    summarise(
+      across(all_of(all_source_cols), sum),
+      across(all_of(avail_cols), any),
+      category = sort(unique(category))[1],
+      .groups = "drop"
+    )
+  
+  label_category <- heat_collapsed %>% select(lipid_label, category)
+  
+  if (nrow(heat_collapsed) == 0) {
+    cat("  WARNING: no rows available for heatmap/table — skipped.\n")
+  } else {
+    
+    n_lip <- nrow(heat_collapsed)
+    mat_h <- matrix(NA_real_, nrow = n_lip, ncol = length(rep_col_labels),
+                    dimnames = list(heat_collapsed$lipid_label, rep_col_labels))
+    avail_h <- matrix(TRUE, nrow = n_lip, ncol = length(rep_col_labels),
+                      dimnames = list(heat_collapsed$lipid_label, rep_col_labels))
+    best_cv_per_lipid <- setNames(vector("list", length(sample_blocks)),
+                                  sapply(sample_blocks, `[[`, "sample"))
+    
+    for (b in sample_blocks) {
+      s <- b$sample
+      out_cols <- rep_col_labels[startsWith(rep_col_labels, paste0(s, "_"))]
+      
+      di_out <- out_cols[grepl("_DI_rep", out_cols)]
+      if (length(b$di_cols) > 0 && length(di_out) > 0) {
+        mat_h[, di_out] <- as.matrix(heat_collapsed[, b$di_cols])
+        di_avail <- heat_collapsed[[paste0(".avail_", s, "_DI")]]
+        avail_h[, di_out] <- matrix(rep(di_avail, length(di_out)), ncol = length(di_out))
+      }
+      
+      fo_out <- out_cols[grepl("_FAIMSoff_rep", out_cols)]
+      if (length(b$fo_cols) > 0 && length(fo_out) > 0) {
+        mat_h[, fo_out] <- as.matrix(heat_collapsed[, b$fo_cols])
+        fo_avail <- heat_collapsed[[paste0(".avail_", s, "_FAIMSoff")]]
+        avail_h[, fo_out] <- matrix(rep(fo_avail, length(fo_out)), ncol = length(fo_out))
+      }
+      
+      bestcv_out <- out_cols[grepl("_FAIMS_bestCV_rep", out_cols)]
+      if (length(b$faims_cv_blocks) > 0 && length(bestcv_out) > 0) {
+        cv_names <- names(b$faims_cv_blocks)
+        cv_means <- sapply(cv_names, function(cvn) {
+          cols <- b$faims_cv_blocks[[cvn]]
+          rowMeans(as.matrix(heat_collapsed[, cols]), na.rm = TRUE)
+        })
+        if (is.null(dim(cv_means))) cv_means <- matrix(cv_means, nrow = n_lip)
+        best_idx <- apply(cv_means, 1, function(x) {
+          if (all(is.na(x))) return(NA_integer_); which.max(x)
+        })
+        best_cv_per_lipid[[s]] <- ifelse(is.na(best_idx), NA_character_, cv_names[best_idx])
+        for (i in seq_len(n_lip)) {
+          if (is.na(best_idx[i])) next
+          cols <- b$faims_cv_blocks[[best_idx[i]]]
+          mat_h[i, bestcv_out] <- as.numeric(as.matrix(heat_collapsed[i, cols]))
+        }
+        faims_avail <- heat_collapsed[[paste0(".avail_", s, "_FAIMS")]]
+        avail_h[, bestcv_out] <- matrix(rep(faims_avail, length(bestcv_out)),
+                                        ncol = length(bestcv_out))
+      }
+    }
+    
+    mat_h_full   <- mat_h
+    avail_h_full <- avail_h
+    best_cv_full <- best_cv_per_lipid
+    
+    # =========================================================================
+    # 14. BEST-CV HEATMAP (endogenous)
+    # =========================================================================
+    
+    if (generate_heatmap) {
+      cat("\n========================================\n")
+      cat("Category-grouped heatmap (best CV per lipid)\n")
+      cat("========================================\n\n")
+      
+      mat_hm   <- mat_h
+      avail_hm <- avail_h
+      
+      if (!is.null(heatmap_categories) && !identical(heatmap_categories, "all")) {
+        keep_labels <- label_category$lipid_label[label_category$category %in% heatmap_categories]
+        keep_idx    <- rownames(mat_hm) %in% keep_labels
+        mat_hm      <- mat_hm[keep_idx, , drop = FALSE]
+        avail_hm    <- avail_hm[keep_idx, , drop = FALSE]
+      }
+      
+      if (nrow(mat_hm) == 0) {
+        cat("  WARNING: heatmap_categories filter removed all lipids — best-CV heatmap skipped.\n")
+      } else {
+        mat_hm[is.na(mat_hm)] <- 0
+        log2_hm <- log2(mat_hm + 1); log2_hm[!is.finite(log2_hm)] <- 0
+        scaled_hm <- pareto_scale(log2_hm)
+        
+        row_meta <- data.frame(lipid_label = rownames(mat_hm), stringsAsFactors = FALSE) %>%
+          left_join(label_category, by = "lipid_label") %>%
+          mutate(category = if_else(is.na(category), "Uncategorized", category))
+        
+        if (heatmap_cluster_within_category) {
+          cat_groups <- split(row_meta$lipid_label, row_meta$category)
+          row_ord <- unlist(lapply(sort(names(cat_groups)), function(cat_name) {
+            labels_in_cat <- cat_groups[[cat_name]]
+            if (length(labels_in_cat) > 1) {
+              sub_mat <- scaled_hm[labels_in_cat, , drop = FALSE]
+              labels_in_cat[hclust(dist(sub_mat), method = "complete")$order]
+            } else labels_in_cat
+          }), use.names = FALSE)
+          row_meta <- row_meta[match(row_ord, row_meta$lipid_label), ]
+        } else {
+          row_meta <- row_meta %>% arrange(category, lipid_label)
+          row_ord  <- row_meta$lipid_label
+        }
+        
+        long_hm <- data.frame(
+          lipid   = rep(rownames(scaled_hm), times = ncol(scaled_hm)),
+          x_label = rep(colnames(scaled_hm), each  = nrow(scaled_hm)),
+          value   = as.vector(scaled_hm),
+          avail   = as.vector(avail_hm)
+        ) %>%
+          mutate(value   = ifelse(avail, value, NA_real_),
+                 lipid   = factor(lipid,   levels = rev(row_ord)),
+                 x_label = factor(x_label, levels = rep_col_labels))
+        
+        x_sep <- cumsum(block_sizes); x_sep <- x_sep[-length(x_sep)] + 0.5
+        cat_seq_btt <- rev(row_meta$category)
+        cat_counts  <- table(factor(cat_seq_btt, levels = unique(cat_seq_btt)))
+        y_sep <- cumsum(as.numeric(cat_counts)); y_sep <- y_sep[-length(y_sep)] + 0.5
+        sl <- max(abs(range(long_hm$value, na.rm = TRUE)))
+        ph <- max(6, nrow(scaled_hm) * 0.3)
+        pw <- length(rep_col_labels) * 0.5 + 4
+        
+        instr_info <- paste0("DI", if (has_FAIMSoff) " + FAIMSoff" else "",
+                             " + FAIMS (best CV per lipid from {",
+                             paste(cv_labels, collapse = ", "), "})")
+        
+        p_heat <- ggplot(long_hm, aes(x = x_label, y = lipid, fill = value)) +
+          geom_tile(colour = "white", linewidth = 0.25) +
+          { lapply(x_sep, function(xs)
+            geom_vline(xintercept = xs, colour = "grey30", linewidth = 0.8)) } +
+          { lapply(y_sep, function(ys)
+            geom_hline(yintercept = ys, colour = "grey30", linewidth = 0.8)) } +
+          scale_fill_gradientn(colours = heatmap_colours, limits = c(-sl, sl),
+                               na.value = "grey85", name = "Pareto-scaled\nlog2") +
+          scale_x_discrete(position = "top") +
+          scale_y_discrete(expand = c(0, 0)) +
+          labs(
+            title    = sprintf("Lipidome — sum-composition species by category × replicates (%s mode)",
+                               toupper(mode)),
+            subtitle = paste0("Signal: ", paste(signal_samples, collapse = ", "),
+                              " | ", instr_info, "\n",
+                              "log2(abundance) | Pareto scaled | rows grouped by LipidMaps Category (A-Z)",
+                              " | LMSD matched (\u00b1", ppm_threshold, " ppm)\n",
+                              "grey = not detected in that instrument"),
+            x = "Sample / condition replicate", y = "Sum-composition lipid") +
+          theme_minimal(base_size = 10) +
+          theme(axis.text.x       = element_text(angle = 45, hjust = 0, vjust = 0, size = 7),
+                axis.text.y       = element_text(size = 7),
+                legend.key.height = unit(1.5, "cm"),
+                panel.grid        = element_blank(),
+                plot.title        = element_text(face = "bold"))
+        
+        ggsave(sub("\\.xlsx$", "_category_heatmap.pdf", file_output), p_heat,
+               width = pw, height = ph, limitsize = FALSE)
+        ggsave(sub("\\.xlsx$", "_category_heatmap.png", file_output), p_heat,
+               width = pw, height = ph, limitsize = FALSE, dpi = 180)
+        cat("Category heatmap (best CV) saved.\n")
+        
+        ref_table <- row_meta %>% select(category, lipid_label)
+        for (s in names(best_cv_per_lipid)) {
+          bcv <- best_cv_per_lipid[[s]]
+          if (!is.null(bcv)) {
+            names(bcv) <- rownames(mat_hm)
+            ref_table[[paste0("best_CV_", s)]] <- paste0("CV", bcv[ref_table$lipid_label])
+            ref_table[[paste0("best_CV_", s)]][is.na(bcv[ref_table$lipid_label])] <- NA_character_
+          }
+        }
+        write_xlsx_cov(ref_table,
+                       sub("\\.xlsx$", "_category_heatmap_categories.xlsx", file_output))
+      }
+    }
+    
+    # =========================================================================
+    # 15. FAIMS vs DI COMPARISON TABLE (endogenous)
+    # =========================================================================
+    
+    if (generate_faims_di_table) {
+      cat("\n========================================\n")
+      cat("FAIMS vs DI comparison table\n")
+      cat("========================================\n\n")
+      
+      meta_table <- heat_df %>%
+        group_by(lipid_label) %>%
+        summarise(
+          sum_composition_syn = { v <- sum_composition_syn[!is.na(sum_composition_syn) & sum_composition_syn != ""]; if (length(v) > 0) v[1] else NA_character_ },
+          common_name    = paste(unique(common_names[!is.na(common_names) & common_names != ""]), collapse = "; "),
+          theoretical_mz = suppressWarnings(min(theoretical_mz, na.rm = TRUE)),
+          mz_DI       = { v <- mz_DI[!is.na(mz_DI)];             if (length(v) > 0) v[1] else NA_real_ },
+          ppm_DI      = { v <- ppm_DI[!is.na(ppm_DI)];           if (length(v) > 0) v[1] else NA_real_ },
+          mz_FAIMSoff = { v <- mz_FAIMSoff[!is.na(mz_FAIMSoff)]; if (length(v) > 0) v[1] else NA_real_ },
+          ppm_FAIMSoff= { v <- ppm_FAIMSoff[!is.na(ppm_FAIMSoff)];if(length(v) > 0) v[1] else NA_real_ },
+          mz_FAIMS    = { v <- mz_FAIMS[!is.na(mz_FAIMS)];       if (length(v) > 0) v[1] else NA_real_ },
+          ppm_FAIMS   = { v <- ppm_FAIMS[!is.na(ppm_FAIMS)];     if (length(v) > 0) v[1] else NA_real_ },
+          .groups = "drop"
+        ) %>%
+        mutate(theoretical_mz = ifelse(is.infinite(theoretical_mz), NA_real_, theoretical_mz))
+      
+      for (b in sample_blocks) {
+        s <- b$sample
+        out_cols   <- rep_col_labels[startsWith(rep_col_labels, paste0(s, "_"))]
+        di_out     <- out_cols[grepl("_DI_rep",           out_cols)]
+        fo_out     <- out_cols[grepl("_FAIMSoff_rep",     out_cols)]
+        bestcv_out <- out_cols[grepl("_FAIMS_bestCV_rep", out_cols)]
+        
+        if (length(di_out) == 0 && length(bestcv_out) == 0) next
+        
+        lipid_labels <- rownames(mat_h_full)
+        n_lip_full   <- length(lipid_labels)
+        
+        di_vals  <- if (length(di_out) > 0) {
+          v <- mat_h_full[, di_out, drop = FALSE]
+          v[!avail_h_full[, di_out[1]], ] <- NA_real_; v
+        } else matrix(NA_real_, nrow = n_lip_full, ncol = n_replicates)
+        di_mean  <- rowMeans(di_vals, na.rm = TRUE); di_mean[is.nan(di_mean)] <- NA_real_
+        di_sd    <- apply(di_vals, 1, sd, na.rm = TRUE)
+        di_cov   <- (di_sd / di_mean) * 100; di_cov[is.nan(di_cov)] <- NA_real_
+        
+        fo_mean <- rep(NA_real_, n_lip_full)
+        if (length(fo_out) > 0) {
+          fo_vals <- mat_h_full[, fo_out, drop = FALSE]
+          fo_vals[!avail_h_full[, fo_out[1]], ] <- NA_real_
+          fo_mean_tmp <- rowMeans(fo_vals, na.rm = TRUE)
+          fo_mean_tmp[is.nan(fo_mean_tmp)] <- NA_real_
+          fo_mean <- fo_mean_tmp
+        }
+        
+        faims_vals <- if (length(bestcv_out) > 0) {
+          v <- mat_h_full[, bestcv_out, drop = FALSE]
+          v[!avail_h_full[, bestcv_out[1]], ] <- NA_real_; v
+        } else matrix(NA_real_, nrow = n_lip_full, ncol = n_replicates)
+        faims_mean <- rowMeans(faims_vals, na.rm = TRUE); faims_mean[is.nan(faims_mean)] <- NA_real_
+        faims_sd   <- apply(faims_vals, 1, sd, na.rm = TRUE)
+        faims_cov  <- (faims_sd / faims_mean) * 100; faims_cov[is.nan(faims_cov)] <- NA_real_
+        best_cv    <- best_cv_full[[s]]
+        best_cv_label <- if (!is.null(best_cv))
+          ifelse(is.na(best_cv), NA_character_, paste0("CV", best_cv))
+        else rep(NA_character_, n_lip_full)
+        
+        log2FC  <- log2((faims_mean + 1) / (di_mean + 1))
+        p_value <- vapply(seq_len(n_lip_full), function(i) {
+          x <- faims_vals[i, ][!is.na(faims_vals[i, ])]
+          y <- di_vals[i, ][!is.na(di_vals[i, ])]
+          if (length(x) < 2 || length(y) < 2) return(NA_real_)
+          alt <- if (mean(x) > mean(y)) "greater" else "less"
+          tryCatch(t.test(x, y, alternative = alt, var.equal = FALSE)$p.value,
+                   error = function(e) NA_real_)
+        }, numeric(1))
+        
+        m_idx <- match(lipid_labels, meta_table$lipid_label)
+        out_df <- data.frame(
+          theoretical_mz      = meta_table$theoretical_mz[m_idx],
+          sum_composition_syn = meta_table$sum_composition_syn[m_idx],
+          common_name         = meta_table$common_name[m_idx],
+          mz_DI               = meta_table$mz_DI[m_idx],
+          ppm_DI              = meta_table$ppm_DI[m_idx],
+          stringsAsFactors    = FALSE
+        )
+        colnames(di_vals) <- paste0("DI_rep", seq_len(ncol(di_vals)))
+        out_df <- cbind(out_df, as.data.frame(di_vals))
+        out_df$mean_DI_abundance <- di_mean
+        out_df$CoV_pct_DI        <- di_cov
+        if (has_FAIMSoff) {
+          out_df$mz_FAIMSoff             <- meta_table$mz_FAIMSoff[m_idx]
+          out_df$ppm_FAIMSoff            <- meta_table$ppm_FAIMSoff[m_idx]
+          out_df$mean_FAIMSoff_abundance <- fo_mean
+        }
+        out_df$mz_FAIMS  <- meta_table$mz_FAIMS[m_idx]
+        out_df$ppm_FAIMS <- meta_table$ppm_FAIMS[m_idx]
+        colnames(faims_vals) <- paste0("FAIMS_rep", seq_len(ncol(faims_vals)))
+        out_df <- cbind(out_df, as.data.frame(faims_vals))
+        out_df$best_CV              <- best_cv_label
+        out_df$mean_FAIMS_abundance <- faims_mean
+        out_df$CoV_pct_FAIMS        <- faims_cov
+        out_df$log2FC_FAIMS_vs_DI   <- round(log2FC, 3)
+        out_df$p_value_FAIMS_vs_DI  <- signif(p_value, 4)
+        rownames(out_df) <- NULL
+        
+        out_file <- sub("\\.xlsx$", sprintf("_FAIMS_vs_DI_%s.xlsx", s), file_output)
+        write_faims_di_table(out_df, out_file,
+                             fc_col       = "log2FC_FAIMS_vs_DI",
+                             fc_threshold = faims_di_fc_threshold,
+                             p_col        = "p_value_FAIMS_vs_DI")
+        cat(sprintf("  %s: %d rows written to %s\n", s, nrow(out_df), out_file))
+      }
+    }
+    
+    # =========================================================================
+    # 16. ALL-CVs HEATMAP (endogenous)
+    # =========================================================================
+    
+    if (generate_heatmap_all_cv) {
+      cat("\n========================================\n")
+      cat("All-CVs heatmap\n")
+      cat("========================================\n\n")
+      
+      rep_col_labels2 <- unlist(lapply(sample_blocks, function(b) {
+        out <- character(0)
+        if (length(b$di_cols) > 0)
+          out <- c(out, paste0(b$sample, "_DI_rep", seq_along(b$di_cols)))
+        if (length(b$fo_cols) > 0)
+          out <- c(out, paste0(b$sample, "_FAIMSoff_rep", seq_along(b$fo_cols)))
+        for (cv_name in names(b$faims_cv_blocks))
+          out <- c(out, paste0(b$sample, "_FAIMS_CV", cv_name, "_rep",
+                               seq_along(b$faims_cv_blocks[[cv_name]])))
+        out
+      }))
+      block_sizes2 <- unlist(lapply(sample_blocks, function(b) {
+        sizes <- c()
+        if (length(b$di_cols) > 0) sizes <- c(sizes, length(b$di_cols))
+        if (length(b$fo_cols) > 0) sizes <- c(sizes, length(b$fo_cols))
+        for (cv_name in names(b$faims_cv_blocks))
+          sizes <- c(sizes, length(b$faims_cv_blocks[[cv_name]]))
+        sizes
+      }))
+      
+      n_lip2   <- nrow(heat_collapsed)
+      mat_h2   <- matrix(NA_real_, nrow = n_lip2, ncol = length(rep_col_labels2),
+                         dimnames = list(heat_collapsed$lipid_label, rep_col_labels2))
+      avail_h2 <- matrix(TRUE, nrow = n_lip2, ncol = length(rep_col_labels2),
+                         dimnames = list(heat_collapsed$lipid_label, rep_col_labels2))
+      
+      for (b in sample_blocks) {
+        s        <- b$sample
+        out_cols <- rep_col_labels2[startsWith(rep_col_labels2, paste0(s, "_"))]
+        di_out   <- out_cols[grepl("_DI_rep", out_cols)]
+        if (length(b$di_cols) > 0 && length(di_out) > 0) {
+          mat_h2[, di_out]   <- as.matrix(heat_collapsed[, b$di_cols])
+          di_avail <- heat_collapsed[[paste0(".avail_", s, "_DI")]]
+          avail_h2[, di_out] <- matrix(rep(di_avail, length(di_out)), ncol = length(di_out))
+        }
+        fo_out <- out_cols[grepl("_FAIMSoff_rep", out_cols)]
+        if (length(b$fo_cols) > 0 && length(fo_out) > 0) {
+          mat_h2[, fo_out]   <- as.matrix(heat_collapsed[, b$fo_cols])
+          fo_avail <- heat_collapsed[[paste0(".avail_", s, "_FAIMSoff")]]
+          avail_h2[, fo_out] <- matrix(rep(fo_avail, length(fo_out)), ncol = length(fo_out))
+        }
+        for (cv_name in names(b$faims_cv_blocks)) {
+          cv_out  <- out_cols[grepl(paste0("_FAIMS_CV", cv_name, "_rep"), out_cols)]
+          cv_cols <- b$faims_cv_blocks[[cv_name]]
+          if (length(cv_out) > 0) {
+            mat_h2[, cv_out]   <- as.matrix(heat_collapsed[, cv_cols])
+            cv_avail <- heat_collapsed[[paste0(".avail_", s, "_FAIMS_", cv_name)]]
+            avail_h2[, cv_out] <- matrix(rep(cv_avail, length(cv_out)), ncol = length(cv_out))
+          }
+        }
+      }
+      
+      if (!is.null(heatmap_categories) && !identical(heatmap_categories, "all")) {
+        keep_labels2 <- label_category$lipid_label[label_category$category %in% heatmap_categories]
+        keep_idx2    <- rownames(mat_h2) %in% keep_labels2
+        mat_h2   <- mat_h2[keep_idx2, , drop = FALSE]
+        avail_h2 <- avail_h2[keep_idx2, , drop = FALSE]
+      }
+      
+      if (nrow(mat_h2) == 0) {
+        cat("  WARNING: heatmap_categories filter removed all lipids — all-CVs heatmap skipped.\n")
+      } else {
+        mat_h2[is.na(mat_h2)] <- 0
+        log2_h2 <- log2(mat_h2 + 1); log2_h2[!is.finite(log2_h2)] <- 0
+        scaled_h2 <- pareto_scale(log2_h2)
+        
+        row_meta2 <- data.frame(lipid_label = rownames(mat_h2), stringsAsFactors = FALSE) %>%
+          left_join(label_category, by = "lipid_label") %>%
+          mutate(category = if_else(is.na(category), "Uncategorized", category))
+        
+        if (heatmap_cluster_within_category) {
+          cat_groups2 <- split(row_meta2$lipid_label, row_meta2$category)
+          row_ord2 <- unlist(lapply(sort(names(cat_groups2)), function(cat_name) {
+            labels_in_cat <- cat_groups2[[cat_name]]
+            if (length(labels_in_cat) > 1) {
+              sub_mat <- scaled_h2[labels_in_cat, , drop = FALSE]
+              labels_in_cat[hclust(dist(sub_mat), method = "complete")$order]
+            } else labels_in_cat
+          }), use.names = FALSE)
+          row_meta2 <- row_meta2[match(row_ord2, row_meta2$lipid_label), ]
+        } else {
+          row_meta2 <- row_meta2 %>% arrange(category, lipid_label)
+          row_ord2  <- row_meta2$lipid_label
+        }
+        
+        long_h2 <- data.frame(
+          lipid   = rep(rownames(scaled_h2), times = ncol(scaled_h2)),
+          x_label = rep(colnames(scaled_h2), each  = nrow(scaled_h2)),
+          value   = as.vector(scaled_h2),
+          avail   = as.vector(avail_h2)
+        ) %>%
+          mutate(value   = ifelse(avail, value, NA_real_),
+                 lipid   = factor(lipid,   levels = rev(row_ord2)),
+                 x_label = factor(x_label, levels = rep_col_labels2))
+        
+        x_sep2 <- cumsum(block_sizes2); x_sep2 <- x_sep2[-length(x_sep2)] + 0.5
+        cat_seq_btt2 <- rev(row_meta2$category)
+        cat_counts2  <- table(factor(cat_seq_btt2, levels = unique(cat_seq_btt2)))
+        y_sep2 <- cumsum(as.numeric(cat_counts2)); y_sep2 <- y_sep2[-length(y_sep2)] + 0.5
+        sl2 <- max(abs(range(long_h2$value, na.rm = TRUE)))
+        ph2 <- max(6, nrow(scaled_h2) * 0.3)
+        pw2 <- length(rep_col_labels2) * 0.5 + 4
+        
+        instr_info2 <- paste0("DI", if (has_FAIMSoff) " + FAIMSoff" else "",
+                              " + FAIMS all CVs {", paste(cv_labels, collapse = ", "), "}")
+        
+        p_heat2 <- ggplot(long_h2, aes(x = x_label, y = lipid, fill = value)) +
+          geom_tile(colour = "white", linewidth = 0.25) +
+          { lapply(x_sep2, function(xs)
+            geom_vline(xintercept = xs, colour = "grey30", linewidth = 0.8)) } +
+          { lapply(y_sep2, function(ys)
+            geom_hline(yintercept = ys, colour = "grey30", linewidth = 0.8)) } +
+          scale_fill_gradientn(colours = heatmap_colours, limits = c(-sl2, sl2),
+                               na.value = "grey85", name = "Pareto-scaled\nlog2") +
+          scale_x_discrete(position = "top") +
+          scale_y_discrete(expand = c(0, 0)) +
+          labs(
+            title    = sprintf("Lipidome — sum-composition species by category × replicates, all CVs (%s mode)",
+                               toupper(mode)),
+            subtitle = paste0("Signal: ", paste(signal_samples, collapse = ", "),
+                              " | ", instr_info2, "\n",
+                              "log2(abundance) | Pareto scaled | rows grouped by LipidMaps Category (A-Z)",
+                              " | LMSD matched (\u00b1", ppm_threshold, " ppm)\n",
+                              "grey = not detected in that instrument/CV"),
+            x = "Sample / condition / CV replicate", y = "Sum-composition lipid") +
+          theme_minimal(base_size = 10) +
+          theme(axis.text.x       = element_text(angle = 45, hjust = 0, vjust = 0, size = 7),
+                axis.text.y       = element_text(size = 7),
+                legend.key.height = unit(1.5, "cm"),
+                panel.grid        = element_blank(),
+                plot.title        = element_text(face = "bold"))
+        
+        ggsave(sub("\\.xlsx$", "_category_heatmap_allCV.pdf", file_output), p_heat2,
+               width = pw2, height = ph2, limitsize = FALSE)
+        ggsave(sub("\\.xlsx$", "_category_heatmap_allCV.png", file_output), p_heat2,
+               width = pw2, height = ph2, limitsize = FALSE, dpi = 180)
+        cat("All-CVs category heatmap saved.\n")
+      }
+    }
+    
+  } # end else (nrow(heat_collapsed) > 0)
+} # end if (generate_heatmap || ...)
+
+# =============================================================================
+# 17. IS LIPID OUTPUT
+#     Heatmaps (best CV + all CVs), boxplots (best CV + all CVs),
+#     per-sample Excel tables
+# =============================================================================
+
+if (has_IS_ref) {
+  
+  library(ggplot2)
+  
+  if (IS_boxplot_significance || IS_boxplot_significance_allCV) {
+    library(rstatix)
+    library(ggpubr)
+  }
+  
+  # ---------------------------------------------------------------------------
+  # 17a. Label helper and data collection
+  # ---------------------------------------------------------------------------
+  
+  is_label_fn <- function(df) {
+    sc  <- as.character(df$sum_composition_syn)
+    cn  <- as.character(df$common_name)
+    sys <- as.character(df$systematic_name)
+    ids <- as.character(df$lmsd_id)
+    is_blank <- function(x) is.na(x) | trimws(x) == ""
+    lab <- sc
+    lab[is_blank(lab)] <- cn[is_blank(lab)]
+    lab[is_blank(lab)] <- sys[is_blank(lab)]
+    lab[is_blank(lab)] <- ids[is_blank(lab)]
+    lab
+  }
+  add_is_label <- function(df) {
+    if (nrow(df) == 0) return(df)
+    df$is_label <- is_label_fn(df); df
+  }
+  
+  DI_IS_m    <- add_is_label(if (exists("DI_IS_matched"))      DI_IS_matched      else data.frame())
+  FO_IS_m    <- add_is_label(if (exists("FAIMSoff_IS_matched")) FAIMSoff_IS_matched else data.frame())
+  FAIMS_IS_m <- add_is_label(if (exists("FAIMS_IS_matched"))    FAIMS_IS_matched    else data.frame())
+  
+  all_is_labels <- sort(unique(c(
+    if (nrow(DI_IS_m)    > 0) DI_IS_m$is_label,
+    if (nrow(FO_IS_m)    > 0) FO_IS_m$is_label,
+    if (nrow(FAIMS_IS_m) > 0) FAIMS_IS_m$is_label
+  )))
+  n_is <- length(all_is_labels)
+  cat(sprintf("\nIS output: %d unique IS lipids across all instruments.\n", n_is))
+  
+  # ---------------------------------------------------------------------------
+  # 17b. Build abundance matrices
+  # ---------------------------------------------------------------------------
+  
+  extract_rep_matrix <- function(matched_df, sample_names, sample_cols_list,
+                                 all_labels, n_rep) {
+    col_names <- unlist(lapply(sample_names, function(s)
+      paste0(s, "_rep", seq_len(n_rep))))
+    mat <- matrix(NA_real_, nrow = length(all_labels), ncol = length(col_names),
+                  dimnames = list(all_labels, col_names))
+    if (nrow(matched_df) == 0) return(mat)
+    for (s in sample_names) {
+      src_cols <- intersect(sample_cols_list[[s]], colnames(matched_df))
+      out_cols <- paste0(s, "_rep", seq_len(n_rep))
+      for (lab in all_labels) {
+        rows <- matched_df[matched_df$is_label == lab, , drop = FALSE]
+        if (nrow(rows) == 0) next
+        mat[lab, out_cols] <- as.numeric(colSums(rows[, src_cols, drop = FALSE], na.rm = TRUE))
+      }
+    }
+    mat
+  }
+  
+  DI_IS_mat <- extract_rep_matrix(
+    DI_IS_m, is_signal_samples, DI_sample_cols, all_is_labels, n_replicates)
+  
+  FO_IS_mat <- if (has_FAIMSoff && nrow(FO_IS_m) > 0)
+    extract_rep_matrix(FO_IS_m, is_signal_samples, FAIMSoff_sample_cols,
+                       all_is_labels, n_replicates)
+  else
+    matrix(NA_real_, nrow = n_is,
+           ncol = length(is_signal_samples) * n_replicates,
+           dimnames = list(all_is_labels,
+                           unlist(lapply(is_signal_samples, function(s)
+                             paste0(s, "_rep", seq_len(n_replicates))))))
+  
+  FAIMS_IS_bestcv_mat <- matrix(
+    NA_real_, nrow = n_is,
+    ncol = length(is_signal_samples) * n_replicates,
+    dimnames = list(all_is_labels,
+                    unlist(lapply(is_signal_samples, function(s)
+                      paste0(s, "_FAIMS_bestCV_rep", seq_len(n_replicates))))))
+  best_cv_is <- matrix(NA_character_, nrow = n_is, ncol = length(is_signal_samples),
+                       dimnames = list(all_is_labels, is_signal_samples))
+  
+  allcv_col_names <- unlist(lapply(is_signal_samples, function(s)
+    unlist(lapply(cv_labels, function(cv)
+      paste0(s, "_FAIMS_", cv, "_rep", seq_len(n_replicates))))))
+  FAIMS_IS_allcv_mat <- matrix(
+    NA_real_, nrow = n_is, ncol = length(allcv_col_names),
+    dimnames = list(all_is_labels, allcv_col_names))
+  
+  if (nrow(FAIMS_IS_m) > 0) {
+    for (s in is_signal_samples) {
+      cv_blocks <- lapply(cv_labels, function(cv)
+        paste0(s, "_", cv, "_rep", seq_len(n_replicates)))
+      names(cv_blocks) <- cv_labels
+      
+      for (lab in all_is_labels) {
+        rows <- FAIMS_IS_m[FAIMS_IS_m$is_label == lab, , drop = FALSE]
+        if (nrow(rows) == 0) next
+        
+        for (cv in cv_labels) {
+          src_cols <- intersect(cv_blocks[[cv]], colnames(rows))
+          out_cols <- paste0(s, "_FAIMS_", cv, "_rep", seq_len(n_replicates))
+          if (length(src_cols) > 0)
+            FAIMS_IS_allcv_mat[lab, out_cols] <-
+            as.numeric(colSums(rows[, src_cols, drop = FALSE], na.rm = TRUE))
+        }
+        
+        cv_means <- sapply(cv_labels, function(cv) {
+          src_cols <- intersect(cv_blocks[[cv]], colnames(rows))
+          if (length(src_cols) == 0) return(NA_real_)
+          mean(colSums(rows[, src_cols, drop = FALSE], na.rm = TRUE))
+        })
+        best_cv <- cv_labels[which.max(cv_means)]
+        if (!is.na(best_cv)) {
+          src_cols <- intersect(cv_blocks[[best_cv]], colnames(rows))
+          out_cols <- paste0(s, "_FAIMS_bestCV_rep", seq_len(n_replicates))
+          FAIMS_IS_bestcv_mat[lab, out_cols] <-
+            as.numeric(colSums(rows[, src_cols, drop = FALSE], na.rm = TRUE))
+          best_cv_is[lab, s] <- best_cv
+        }
+      }
+    }
+  }
+  
+  get_mz_ppm <- function(matched_df) {
+    if (nrow(matched_df) == 0)
+      return(data.frame(is_label = all_is_labels, mz = NA_real_, ppm = NA_real_))
+    matched_df %>%
+      group_by(is_label) %>%
+      summarise(mz  = mz[which.min(abs(ppm_error))][1],
+                ppm = ppm_error[which.min(abs(ppm_error))][1],
+                .groups = "drop") %>%
+      right_join(data.frame(is_label = all_is_labels), by = "is_label") %>%
+      arrange(match(is_label, all_is_labels))
+  }
+  
+  mz_ppm_DI    <- get_mz_ppm(DI_IS_m)
+  mz_ppm_FO    <- get_mz_ppm(FO_IS_m)
+  mz_ppm_FAIMS <- get_mz_ppm(FAIMS_IS_m)
+  
+  theo_mz_vec <- sapply(all_is_labels, function(lab) {
+    for (df in list(DI_IS_m, FO_IS_m, FAIMS_IS_m)) {
+      rows <- df[df$is_label == lab, ]
+      if (nrow(rows) > 0) return(rows$theoretical_mz[1])
+    }
+    NA_real_
+  })
+  
+  # ---------------------------------------------------------------------------
+  # 17c. Statistics helpers
+  # ---------------------------------------------------------------------------
+  
+  rep_vals_is <- function(mat, pattern) {
+    cols <- grep(pattern, colnames(mat), value = TRUE)
+    if (length(cols) == 0)
+      return(matrix(NA_real_, nrow = nrow(mat), ncol = n_replicates))
+    as.matrix(mat[, cols, drop = FALSE])
+  }
+  
+  rep_mean_is <- function(mat, pattern) {
+    v <- rowMeans(rep_vals_is(mat, pattern), na.rm = TRUE)
+    v[is.nan(v)] <- NA_real_; v
+  }
+  
+  rep_cov_is <- function(mat, pattern) {
+    m  <- rep_vals_is(mat, pattern)
+    mu <- rowMeans(m, na.rm = TRUE)
+    sg <- apply(m, 1, sd, na.rm = TRUE)
+    v  <- (sg / mu) * 100; v[is.nan(v)] <- NA_real_; v
+  }
+  
+  pairwise_stats_is <- function(vals_a, vals_b) {
+    log2fc <- log2((rowMeans(vals_b, na.rm = TRUE) + 1) /
+                     (rowMeans(vals_a, na.rm = TRUE) + 1))
+    pval <- vapply(seq_len(nrow(vals_a)), function(i) {
+      x <- vals_b[i, ][!is.na(vals_b[i, ])]
+      y <- vals_a[i, ][!is.na(vals_a[i, ])]
+      if (length(x) < 2 || length(y) < 2) return(NA_real_)
+      tryCatch(t.test(x, y, var.equal = FALSE)$p.value,
+               error = function(e) NA_real_)
+    }, numeric(1))
+    list(log2fc = round(log2fc, 3), pval = signif(pval, 4))
+  }
+  
+  # ---------------------------------------------------------------------------
+  # 17d. Heatmap drawing with separators
+  # ---------------------------------------------------------------------------
+  
+  heatmap_colours_IS <- c("#00008B","#0000FF","#4169E1","#87CEEB","#FFFFFF",
+                          "#FFB6C1","#FF4500","#FF0000","#8B0000")
+  
+  pareto_scale_mat <- function(mat) {
+    out <- t(apply(mat, 1, function(x) {
+      mu  <- mean(x, na.rm = TRUE); sig <- sd(x, na.rm = TRUE)
+      if (is.na(mu) || is.na(sig) || sig == 0) return(x - mu)
+      (x - mu) / sqrt(sig)
+    }))
+    colnames(out) <- colnames(mat); out
+  }
+  
+  draw_IS_heatmap_sep <- function(mat, col_labels, sep_after,
+                                  title_str, subtitle_str, file_base) {
+    if (all(is.na(mat))) { cat("  No data — heatmap skipped.\n"); return() }
+    mat_plot <- mat; mat_plot[is.na(mat_plot)] <- 0
+    log2_mat <- log2(mat_plot + 1); log2_mat[!is.finite(log2_mat)] <- 0
+    scaled   <- pareto_scale_mat(log2_mat)
+    scaled[is.na(mat)] <- NA_real_
+    
+    sl <- max(abs(range(scaled, na.rm = TRUE)), na.rm = TRUE)
+    if (!is.finite(sl) || sl == 0) sl <- 1
+    ph <- max(5, nrow(scaled) * 0.38)
+    pw <- ncol(scaled) * 0.48 + 4
+    
+    long_df <- data.frame(
+      lipid   = rep(rownames(scaled), times = ncol(scaled)),
+      x_label = rep(col_labels,       each  = nrow(scaled)),
+      value   = as.vector(scaled)
+    ) %>%
+      mutate(lipid   = factor(lipid,   levels = rev(rownames(scaled))),
+             x_label = factor(x_label, levels = col_labels))
+    
+    p <- ggplot(long_df, aes(x = x_label, y = lipid, fill = value)) +
+      geom_tile(colour = "white", linewidth = 0.3) +
+      { lapply(sep_after, function(xs)
+        geom_vline(xintercept = xs + 0.5, colour = "grey20", linewidth = 0.9)) } +
+      scale_fill_gradientn(colours = heatmap_colours_IS, limits = c(-sl, sl),
+                           na.value = "grey85", name = "Pareto-scaled\nlog2") +
+      scale_x_discrete(position = "top") +
+      scale_y_discrete(expand = c(0, 0)) +
+      labs(title = title_str, subtitle = subtitle_str, x = NULL, y = "IS lipid") +
+      theme_minimal(base_size = 10) +
+      theme(axis.text.x       = element_text(angle = 45, hjust = 0, vjust = 0, size = 7),
+            axis.text.y       = element_text(size = 8),
+            legend.key.height = unit(1.5, "cm"),
+            panel.grid        = element_blank(),
+            plot.title        = element_text(face = "bold"))
+    
+    ggsave(paste0(file_base, ".pdf"), p, width = pw, height = ph, limitsize = FALSE)
+    ggsave(paste0(file_base, ".png"), p, width = pw, height = ph,
+           limitsize = FALSE, dpi = 180)
+    cat(sprintf("  Heatmap saved: %s\n", file_base))
+  }
+  
+  # ---------------------------------------------------------------------------
+  # 17e. Build heatmap matrix + labels
+  #   scope      : "all_samples" | single sample name
+  #   faims_mode : "bestCV" | "allCV"
+  # ---------------------------------------------------------------------------
+  
+  build_IS_heatmap_data <- function(scope, faims_mode) {
+    samples_to_use <- if (scope == "all_samples") is_signal_samples else scope
+    parts <- list(); col_labels <- character(0); sep_after <- numeric(0); col_count <- 0
+    
+    for (cond in c("DI", if (has_FAIMSoff) "FAIMSoff", "FAIMS")) {
+      for (s in samples_to_use) {
+        
+        if (cond == "DI") {
+          sub_mat  <- DI_IS_mat[, grep(paste0("^", s, "_rep"), colnames(DI_IS_mat)), drop = FALSE]
+          new_labs <- paste0(if (scope == "all_samples") paste0(s, "_DI_") else "DI_",
+                             "rep", seq_len(n_replicates))
+          parts <- c(parts, list(sub_mat)); col_labels <- c(col_labels, new_labs)
+          col_count <- col_count + n_replicates
+          
+        } else if (cond == "FAIMSoff") {
+          sub_mat  <- FO_IS_mat[, grep(paste0("^", s, "_rep"), colnames(FO_IS_mat)), drop = FALSE]
+          new_labs <- paste0(if (scope == "all_samples") paste0(s, "_FAIMSoff_") else "FAIMSoff_",
+                             "rep", seq_len(n_replicates))
+          parts <- c(parts, list(sub_mat)); col_labels <- c(col_labels, new_labs)
+          col_count <- col_count + n_replicates
+          
+        } else {  # FAIMS
+          if (faims_mode == "bestCV") {
+            sub_mat  <- FAIMS_IS_bestcv_mat[,
+                                            grep(paste0("^", s, "_FAIMS_bestCV_rep"), colnames(FAIMS_IS_bestcv_mat)),
+                                            drop = FALSE]
+            new_labs <- paste0(if (scope == "all_samples") paste0(s, "_FAIMS_bestCV_") else "FAIMS_bestCV_",
+                               "rep", seq_len(n_replicates))
+            parts <- c(parts, list(sub_mat)); col_labels <- c(col_labels, new_labs)
+            col_count <- col_count + n_replicates
+            sep_after <- c(sep_after, col_count)
+            next
+            
+          } else {  # allCV
+            for (cv in cv_labels) {
+              cv_cols <- grep(paste0("^", s, "_FAIMS_", cv, "_rep"),
+                              colnames(FAIMS_IS_allcv_mat), value = TRUE)
+              sub_mat <- if (length(cv_cols) > 0)
+                FAIMS_IS_allcv_mat[, cv_cols, drop = FALSE]
+              else
+                matrix(NA_real_, nrow = n_is, ncol = n_replicates,
+                       dimnames = list(all_is_labels,
+                                       paste0(s, "_FAIMS_", cv, "_rep", seq_len(n_replicates))))
+              cv_labs <- paste0(
+                if (scope == "all_samples") paste0(s, "_FAIMS_", cv, "_") else paste0("FAIMS_", cv, "_"),
+                "rep", seq_len(n_replicates))
+              parts <- c(parts, list(sub_mat)); col_labels <- c(col_labels, cv_labs)
+              col_count <- col_count + n_replicates
+            }
+            sep_after <- c(sep_after, col_count)
+            next
+          }
+        }
+      }
+      if (cond != "FAIMS") sep_after <- c(sep_after, col_count)
+    }
+    
+    mat_out <- do.call(cbind, parts)
+    rownames(mat_out) <- all_is_labels
+    sep_after <- sep_after[sep_after < ncol(mat_out)]
+    list(mat = mat_out, col_labels = col_labels, sep_after = sep_after)
+  }
+  
+  # ---------------------------------------------------------------------------
+  # 17f. Heatmaps — best CV
+  # ---------------------------------------------------------------------------
+  
+  cat("\n--- IS heatmaps (best CV) ---\n")
+  
+  h1 <- build_IS_heatmap_data("all_samples", "bestCV")
+  draw_IS_heatmap_sep(
+    mat = h1$mat, col_labels = h1$col_labels, sep_after = h1$sep_after,
+    title_str    = sprintf("IS lipids — all samples × conditions, best CV (%s mode)", toupper(mode)),
+    subtitle_str = sprintf("BSM, BLE, sEVLS | DI%s + FAIMS best CV | \u00b1%g ppm | grey = not detected",
+                           if (has_FAIMSoff) " + FAIMSoff" else "", ppm_threshold),
+    file_base    = sub("\\.xlsx$", "_IS_heatmap_all_samples_bestCV", file_output))
+  
+  for (s in is_signal_samples) {
+    hs <- build_IS_heatmap_data(s, "bestCV")
+    draw_IS_heatmap_sep(
+      mat = hs$mat, col_labels = hs$col_labels, sep_after = hs$sep_after,
+      title_str    = sprintf("IS lipids — %s replicates, best CV (%s mode)", s, toupper(mode)),
+      subtitle_str = sprintf("%s | DI%s + FAIMS best CV | \u00b1%g ppm | grey = not detected",
+                             s, if (has_FAIMSoff) " + FAIMSoff" else "", ppm_threshold),
+      file_base    = sub("\\.xlsx$", sprintf("_IS_heatmap_%s_bestCV", s), file_output))
+  }
+  
+  # ---------------------------------------------------------------------------
+  # 17g. Heatmaps — all CVs
+  # ---------------------------------------------------------------------------
+  
+  cat("\n--- IS heatmaps (all CVs) ---\n")
+  
+  h1_acv <- build_IS_heatmap_data("all_samples", "allCV")
+  draw_IS_heatmap_sep(
+    mat = h1_acv$mat, col_labels = h1_acv$col_labels, sep_after = h1_acv$sep_after,
+    title_str    = sprintf("IS lipids — all samples × conditions, all CVs (%s mode)", toupper(mode)),
+    subtitle_str = sprintf("BSM, BLE, sEVLS | DI%s + FAIMS CVs {%s} | \u00b1%g ppm | grey = not detected",
+                           if (has_FAIMSoff) " + FAIMSoff" else "",
+                           paste(cv_labels, collapse = ", "), ppm_threshold),
+    file_base    = sub("\\.xlsx$", "_IS_heatmap_all_samples_allCV", file_output))
+  
+  for (s in is_signal_samples) {
+    hs_acv <- build_IS_heatmap_data(s, "allCV")
+    draw_IS_heatmap_sep(
+      mat = hs_acv$mat, col_labels = hs_acv$col_labels, sep_after = hs_acv$sep_after,
+      title_str    = sprintf("IS lipids — %s replicates, all CVs (%s mode)", s, toupper(mode)),
+      subtitle_str = sprintf("%s | DI%s + FAIMS CVs {%s} | \u00b1%g ppm | grey = not detected",
+                             s, if (has_FAIMSoff) " + FAIMSoff" else "",
+                             paste(cv_labels, collapse = ", "), ppm_threshold),
+      file_base    = sub("\\.xlsx$", sprintf("_IS_heatmap_%s_allCV", s), file_output))
+  }
+  
+  # ---------------------------------------------------------------------------
+  # 17h. Boxplot helper
+  # ---------------------------------------------------------------------------
+  
+  make_allcv_colours <- function(long_df) {
+    lvls <- levels(long_df$condition)
+    base <- c("DI" = "#4472C4", "FAIMSoff" = "#70AD47")
+    cv_lvls <- lvls[!lvls %in% c("DI", "FAIMSoff")]
+    if (length(cv_lvls) > 0) {
+      cv_pal <- colorRampPalette(c("#FFC000", "#C00000"))(length(cv_lvls))
+      names(cv_pal) <- cv_lvls
+      c(base[intersect(names(base), lvls)], cv_pal)
+    } else base[intersect(names(base), lvls)]
+  }
+  
+  draw_IS_boxplot <- function(long_df, title_str, subtitle_str, file_base,
+                              add_sig, show_log2FC = FALSE, per_lipid_png = FALSE,
+                              n_cols_facet = 4, cond_colours = NULL) {
+    if (nrow(long_df) == 0) { cat("  No data - boxplot skipped.\n"); return() }
+    if (is.null(cond_colours))
+      cond_colours <- c("DI" = "#4472C4", "FAIMSoff" = "#70AD47", "FAIMS" = "#ED7D31")
+    
+    make_sig_df <- function(df) {
+      pairs <- combn(levels(droplevels(df$condition)), 2, simplify = FALSE)
+      pairs <- Filter(function(pr) all(pr %in% unique(df$condition)), pairs)
+      if (length(pairs) == 0) return(NULL)
+      tryCatch({
+        tests <- df %>% group_by(IS_lipid) %>%
+          filter({ obs <- table(condition); all(obs[names(obs) %in% unlist(pairs)] >= 2) }) %>%
+          rstatix::t_test(log2_abun ~ condition, comparisons = pairs, p.adjust.method = "BH")
+        rng <- df %>% group_by(IS_lipid) %>%
+          summarise(ymax = max(log2_abun, na.rm = TRUE),
+                    yspan = diff(range(log2_abun, na.rm = TRUE)), .groups = "drop")
+        tests %>% left_join(rng, by = "IS_lipid") %>% group_by(IS_lipid) %>%
+          mutate(y.position = ymax + yspan * 0.08 * seq_len(n()),
+                 xmin = match(group1, levels(df$condition)),
+                 xmax = match(group2, levels(df$condition))) %>% ungroup()
+      }, error = function(e) { message("Significance brackets skipped: ", conditionMessage(e)); NULL })
+    }
+    
+    make_fc_df <- function(df, ref = "DI") {
+      lv <- levels(droplevels(df$condition)); if (!ref %in% lv) ref <- lv[1]
+      means <- df %>% group_by(IS_lipid, condition) %>%
+        summarise(mean_abun = mean(2^log2_abun - 1, na.rm = TRUE),
+                  ytop = max(log2_abun, na.rm = TRUE), .groups = "drop")
+      spans <- df %>% group_by(IS_lipid) %>%
+        summarise(pspan = diff(range(log2_abun, na.rm = TRUE)), .groups = "drop")
+      ref_m <- means %>% filter(condition == ref) %>% select(IS_lipid, ref_abun = mean_abun)
+      means %>% left_join(ref_m, by = "IS_lipid") %>% left_join(spans, by = "IS_lipid") %>%
+        filter(condition != ref) %>%
+        mutate(log2FC = log2((mean_abun + 1) / (ref_abun + 1)),
+               label  = sprintf("%+.2f", log2FC),
+               ypos   = ytop + ifelse(is.finite(pspan) & pspan > 0, pspan * 0.05, 0.3)) %>%
+        filter(is.finite(log2FC))
+    }
+    
+    sig_df <- if (add_sig)     make_sig_df(long_df) else NULL
+    fc_df  <- if (show_log2FC) make_fc_df(long_df)  else NULL
+    
+    base_plot <- function(df, facet, sig_sub, fc_sub) {
+      p <- ggplot(df, aes(x = condition, y = log2_abun, fill = condition)) +
+        geom_boxplot(outlier.size = 1.2, alpha = 0.8, width = 0.6) +
+        geom_jitter(width = 0.15, size = 0.9, alpha = 0.5) +
+        scale_fill_manual(values = cond_colours, guide = "none") +
+        labs(x = "Condition / CV", y = "log2(abundance + 1)") +
+        theme_minimal(base_size = 10) +
+        theme(strip.text  = element_text(size = 7, face = "bold"),
+              axis.text.x = element_text(angle = 35, hjust = 1, size = 7),
+              plot.title  = element_text(face = "bold"))
+      if (facet) p <- p + facet_wrap(~ IS_lipid, scales = "free_y", ncol = n_cols_facet)
+      if (!is.null(sig_sub) && nrow(sig_sub) > 0)
+        p <- p + ggpubr::stat_pvalue_manual(sig_sub, label = "p.adj.signif",
+                                            tip.length = 0.01, size = 3, inherit.aes = FALSE)
+      if (!is.null(fc_sub) && nrow(fc_sub) > 0)
+        p <- p + geom_text(data = fc_sub, aes(x = condition, y = ypos, label = label),
+                           inherit.aes = FALSE, size = 2.8, fontface = "bold", colour = "grey15")
+      p
+    }
+    
+    # Faceted overview (unchanged output path)
+    p <- base_plot(long_df, TRUE, sig_df, fc_df) +
+      labs(title = title_str,
+           subtitle = paste0(subtitle_str, if (show_log2FC) "\nnumbers above boxes = log2FC vs DI" else ""))
+    n_lip <- length(unique(long_df$IS_lipid))
+    n_col <- min(n_cols_facet, n_lip); n_row <- ceiling(n_lip / n_col)
+    n_cond <- nlevels(droplevels(long_df$condition))
+    ph <- max(5, n_row * 3.5); pw <- n_col * max(2.8, n_cond * 0.45) + 1.5
+    ggsave(paste0(file_base, ".pdf"), p, width = pw, height = ph, limitsize = FALSE)
+    ggsave(paste0(file_base, ".png"), p, width = pw, height = ph, limitsize = FALSE, dpi = 180)
+    cat(sprintf("  Boxplot saved: %s\n", file_base))
+    
+    # One PNG per IS lipid
+    if (per_lipid_png) {
+      lip_dir <- paste0(file_base, "_per_lipid")
+      dir.create(lip_dir, showWarnings = FALSE, recursive = TRUE)
+      for (lip in unique(long_df$IS_lipid)) {
+        sub_df <- long_df[long_df$IS_lipid == lip, , drop = FALSE]
+        if (nrow(sub_df) == 0) next
+        sig_sub <- if (!is.null(sig_df)) sig_df[sig_df$IS_lipid == lip, , drop = FALSE] else NULL
+        fc_sub  <- if (!is.null(fc_df))  fc_df[fc_df$IS_lipid == lip, , drop = FALSE]   else NULL
+        p_l <- base_plot(sub_df, FALSE, sig_sub, fc_sub) +
+          labs(title = lip,
+               subtitle = paste0(subtitle_str, if (show_log2FC) " | numbers = log2FC vs DI" else ""))
+        ggsave(file.path(lip_dir, paste0(safe_name(lip), ".png")),
+               p_l, width = max(3.5, n_cond * 0.7 + 1.5), height = 4.2,
+               limitsize = FALSE, dpi = 200)
+      }
+      cat(sprintf("  Per-lipid PNGs saved in: %s/\n", lip_dir))
+    }
+  }
+  
+  # ---------------------------------------------------------------------------
+  # 17i. Build long-format boxplot data
+  # ---------------------------------------------------------------------------
+  
+  build_box_long <- function(sample_subset, faims_mode) {
+    rows_list <- list()
+    
+    for (s in sample_subset) {
+      # DI
+      di_cols <- grep(paste0("^", s, "_rep"), colnames(DI_IS_mat), value = TRUE)
+      if (length(di_cols) > 0) {
+        sub_mat <- DI_IS_mat[, di_cols, drop = FALSE]
+        for (lip in all_is_labels) {
+          v <- as.numeric(sub_mat[lip, ]); v <- v[!is.na(v)]
+          if (length(v) > 0)
+            rows_list <- c(rows_list, lapply(v, function(x)
+              data.frame(IS_lipid = lip, sample = s, condition = "DI",
+                         log2_abun = log2(x + 1), stringsAsFactors = FALSE)))
+        }
+      }
+      # FAIMSoff
+      if (has_FAIMSoff) {
+        fo_cols <- grep(paste0("^", s, "_rep"), colnames(FO_IS_mat), value = TRUE)
+        if (length(fo_cols) > 0) {
+          sub_mat <- FO_IS_mat[, fo_cols, drop = FALSE]
+          for (lip in all_is_labels) {
+            v <- as.numeric(sub_mat[lip, ]); v <- v[!is.na(v)]
+            if (length(v) > 0)
+              rows_list <- c(rows_list, lapply(v, function(x)
+                data.frame(IS_lipid = lip, sample = s, condition = "FAIMSoff",
+                           log2_abun = log2(x + 1), stringsAsFactors = FALSE)))
+          }
+        }
+      }
+      # FAIMS
+      if (faims_mode == "bestCV") {
+        bc_cols <- grep(paste0("^", s, "_FAIMS_bestCV_rep"),
+                        colnames(FAIMS_IS_bestcv_mat), value = TRUE)
+        if (length(bc_cols) > 0) {
+          sub_mat <- FAIMS_IS_bestcv_mat[, bc_cols, drop = FALSE]
+          for (lip in all_is_labels) {
+            v <- as.numeric(sub_mat[lip, ]); v <- v[!is.na(v)]
+            if (length(v) > 0)
+              rows_list <- c(rows_list, lapply(v, function(x)
+                data.frame(IS_lipid = lip, sample = s, condition = "FAIMS",
+                           log2_abun = log2(x + 1), stringsAsFactors = FALSE)))
+          }
+        }
+      } else {
+        for (cv in cv_labels) {
+          cv_cols <- grep(paste0("^", s, "_FAIMS_", cv, "_rep"),
+                          colnames(FAIMS_IS_allcv_mat), value = TRUE)
+          if (length(cv_cols) == 0) next
+          sub_mat <- FAIMS_IS_allcv_mat[, cv_cols, drop = FALSE]
+          for (lip in all_is_labels) {
+            v <- as.numeric(sub_mat[lip, ]); v <- v[!is.na(v)]
+            if (length(v) > 0)
+              rows_list <- c(rows_list, lapply(v, function(x)
+                data.frame(IS_lipid = lip, sample = s, condition = cv,
+                           log2_abun = log2(x + 1), stringsAsFactors = FALSE)))
+          }
+        }
+      }
+    }
+    
+    if (length(rows_list) == 0) return(data.frame())
+    df <- bind_rows(rows_list)
+    lvls <- if (faims_mode == "bestCV")
+      c("DI", if (has_FAIMSoff) "FAIMSoff", "FAIMS")
+    else
+      c("DI", if (has_FAIMSoff) "FAIMSoff", cv_labels)
+    df$condition <- factor(df$condition, levels = intersect(lvls, unique(df$condition)))
+    df
+  }
+  
+  # ---------------------------------------------------------------------------
+  # 17j. Boxplots — best CV
+  # ---------------------------------------------------------------------------
+  
+  cat("\n--- IS boxplots (best CV) ---\n")
+  
+  for (s in is_signal_samples) {
+    long_s <- build_box_long(s, "bestCV")
+    draw_IS_boxplot(
+      long_df      = long_s,
+      title_str    = sprintf("IS lipid abundance — %s, best CV (%s mode)", s, toupper(mode)),
+      subtitle_str = sprintf("%s | DI%s + FAIMS best CV | \u00b1%g ppm | each point = 1 replicate",
+                             s, if (has_FAIMSoff) " + FAIMSoff" else "", ppm_threshold),
+      file_base    = sub("\\.xlsx$", sprintf("_IS_boxplot_%s_bestCV", s), file_output),
+      add_sig      = IS_boxplot_significance,
+      show_log2FC  = IS_boxplot_show_log2FC,       # NEW
+      per_lipid_png = IS_boxplot_per_lipid_png)    # NEW
+  }
+  
+  long_all_bcv <- build_box_long(is_signal_samples, "bestCV")
+  if (nrow(long_all_bcv) > 0) {
+    p_all_bcv <- ggplot(long_all_bcv,
+                        aes(x = condition, y = log2_abun, fill = condition)) +
+      geom_boxplot(outlier.size = 1, alpha = 0.8, width = 0.55) +
+      geom_jitter(width = 0.15, size = 0.8, alpha = 0.45) +
+      scale_fill_manual(values = c("DI" = "#4472C4", "FAIMSoff" = "#70AD47",
+                                   "FAIMS" = "#ED7D31"), guide = "none") +
+      facet_grid(IS_lipid ~ sample, scales = "free_y") +
+      labs(title    = sprintf("IS lipid abundance — all samples, best CV (%s mode)", toupper(mode)),
+           subtitle = sprintf("rows = IS lipid | cols = sample | DI%s + FAIMS best CV | \u00b1%g ppm",
+                              if (has_FAIMSoff) " + FAIMSoff" else "", ppm_threshold),
+           x = "Condition", y = "log2(abundance + 1)") +
+      theme_minimal(base_size = 9) +
+      theme(strip.text.y = element_text(size = 7, angle = 0, face = "bold"),
+            strip.text.x = element_text(size = 8, face = "bold"),
+            axis.text.x  = element_text(angle = 30, hjust = 1, size = 7),
+            plot.title   = element_text(face = "bold"))
+    
+    ph_all <- max(5, n_is * 3.2); pw_all <- length(is_signal_samples) * 3.5 + 2
+    ggsave(sub("\\.xlsx$", "_IS_boxplot_all_samples_bestCV.pdf", file_output),
+           p_all_bcv, width = pw_all, height = ph_all, limitsize = FALSE)
+    ggsave(sub("\\.xlsx$", "_IS_boxplot_all_samples_bestCV.png", file_output),
+           p_all_bcv, width = pw_all, height = ph_all, limitsize = FALSE, dpi = 180)
+    cat("  Boxplot saved: IS_boxplot_all_samples_bestCV\n")
+  }
+  
+  # ---------------------------------------------------------------------------
+  # 17k. Boxplots — all CVs
+  # ---------------------------------------------------------------------------
+  
+  cat("\n--- IS boxplots (all CVs) ---\n")
+  
+  for (s in is_signal_samples) {
+    long_s_acv <- build_box_long(s, "allCV")
+    pal_s      <- make_allcv_colours(long_s_acv)
+    draw_IS_boxplot(
+      long_df      = long_s_acv,
+      title_str    = sprintf("IS lipid abundance — %s, all CVs (%s mode)", s, toupper(mode)),
+      subtitle_str = sprintf("%s | DI%s + FAIMS CVs {%s} | \u00b1%g ppm | each point = 1 replicate",
+                             s, if (has_FAIMSoff) " + FAIMSoff" else "",
+                             paste(cv_labels, collapse = ", "), ppm_threshold),
+      file_base    = sub("\\.xlsx$", sprintf("_IS_boxplot_%s_allCV", s), file_output),
+      add_sig      = IS_boxplot_significance_allCV,
+      show_log2FC  = IS_boxplot_show_log2FC_allCV, # NEW
+      per_lipid_png = IS_boxplot_per_lipid_png,    # NEW
+      cond_colours = pal_s)
+  }
+  
+  long_all_acv <- build_box_long(is_signal_samples, "allCV")
+  if (nrow(long_all_acv) > 0) {
+    pal_all <- make_allcv_colours(long_all_acv)
+    p_all_acv <- ggplot(long_all_acv,
+                        aes(x = condition, y = log2_abun, fill = condition)) +
+      geom_boxplot(outlier.size = 1, alpha = 0.8, width = 0.6) +
+      geom_jitter(width = 0.12, size = 0.7, alpha = 0.4) +
+      scale_fill_manual(values = pal_all, guide = "none") +
+      facet_grid(IS_lipid ~ sample, scales = "free_y") +
+      labs(title    = sprintf("IS lipid abundance — all samples, all CVs (%s mode)", toupper(mode)),
+           subtitle = sprintf("rows = IS lipid | cols = sample | DI%s + FAIMS CVs {%s} | \u00b1%g ppm",
+                              if (has_FAIMSoff) " + FAIMSoff" else "",
+                              paste(cv_labels, collapse = ", "), ppm_threshold),
+           x = "Condition / CV", y = "log2(abundance + 1)") +
+      theme_minimal(base_size = 9) +
+      theme(strip.text.y = element_text(size = 7, angle = 0, face = "bold"),
+            strip.text.x = element_text(size = 8, face = "bold"),
+            axis.text.x  = element_text(angle = 45, hjust = 1, size = 6),
+            plot.title   = element_text(face = "bold"))
+    
+    ph_acv <- max(5, n_is * 3.2)
+    pw_acv <- length(is_signal_samples) * max(4, length(cv_labels) * 0.55) + 2
+    ggsave(sub("\\.xlsx$", "_IS_boxplot_all_samples_allCV.pdf", file_output),
+           p_all_acv, width = pw_acv, height = ph_acv, limitsize = FALSE)
+    ggsave(sub("\\.xlsx$", "_IS_boxplot_all_samples_allCV.png", file_output),
+           p_all_acv, width = pw_acv, height = ph_acv, limitsize = FALSE, dpi = 180)
+    cat("  Boxplot saved: IS_boxplot_all_samples_allCV\n")
+  }
+  
+  # ---------------------------------------------------------------------------
+  # 17l-extra. Log10 abundance spread boxplot — one box per condition,
+  #            all IS lipids x all samples pooled as observations.
+  #            Shows overall signal level and spread; each dot = one replicate.
+  # ---------------------------------------------------------------------------
+  
+  cat("\n--- IS log10 abundance spread boxplot ---\n")
+  
+  if (exists("long_all_bcv") && nrow(long_all_bcv) > 0) {
+    
+    spread_df <- long_all_bcv %>%
+      mutate(
+        abundance  = 2^log2_abun - 1,
+        log10_abun = log10(abundance + 1),
+        condition  = factor(condition, levels = levels(long_all_bcv$condition))
+      )
+    
+    cond_colours_spread <- c("DI" = "#4472C4", "FAIMSoff" = "#70AD47", "FAIMS" = "#ED7D31")
+    
+    p_spread <- ggplot(spread_df,
+                       aes(x = condition, y = log10_abun, fill = condition)) +
+      geom_boxplot(outlier.shape = NA, alpha = 0.8, width = 0.55) +
+      geom_jitter(aes(colour = IS_lipid), width = 0.18, size = 1.8,
+                  alpha = 0.7, show.legend = TRUE) +
+      scale_fill_manual(values = cond_colours_spread, guide = "none") +
+      scale_colour_discrete(name = "IS lipid") +
+      facet_wrap(~ sample, nrow = 1) +
+      labs(
+        title    = sprintf("IS lipid abundance spread per condition (%s mode)", toupper(mode)),
+        subtitle = sprintf(
+          "All IS lipids pooled | DI%s + FAIMS best CV | \u00b1%g ppm | each point = 1 replicate, coloured by IS lipid",
+          if (has_FAIMSoff) " + FAIMSoff" else "", ppm_threshold),
+        x = "Condition", y = "log10(abundance + 1)"
+      ) +
+      theme_minimal(base_size = 11) +
+      theme(strip.text      = element_text(size = 10, face = "bold"),
+            axis.text.x     = element_text(angle = 30, hjust = 1, size = 9),
+            plot.title      = element_text(face = "bold"),
+            legend.position = "right",
+            legend.text     = element_text(size = 8))
+    
+    pw_sp <- length(is_signal_samples) * 3.5 + 3
+    ph_sp <- 5
+    
+    ggsave(sub("\\.xlsx$", "_IS_boxplot_spread_bestCV.pdf", file_output),
+           p_spread, width = pw_sp, height = ph_sp, limitsize = FALSE)
+    ggsave(sub("\\.xlsx$", "_IS_boxplot_spread_bestCV.png", file_output),
+           p_spread, width = pw_sp, height = ph_sp, limitsize = FALSE, dpi = 300)
+    cat("  Boxplot saved: IS_boxplot_spread_bestCV\n")
+  }
+  
+  # ---------------------------------------------------------------------------
+  # 17l. Per-sample Excel output
+  # ---------------------------------------------------------------------------
+  
+  cat("\n--- IS Excel output (per sample) ---\n")
+  
+  conditions_excel <- c("DI", if (has_FAIMSoff) "FAIMSoff", "FAIMS")
+  
+  for (s in is_signal_samples) {
+    
+    di_rep_cols    <- rep_vals_is(DI_IS_mat,          paste0("^", s, "_rep"))
+    fo_rep_cols    <- rep_vals_is(FO_IS_mat,           paste0("^", s, "_rep"))
+    faims_rep_cols <- rep_vals_is(FAIMS_IS_bestcv_mat, paste0("^", s, "_FAIMS_bestCV_rep"))
+    
+    di_mean    <- rowMeans(di_rep_cols,    na.rm = TRUE); di_mean[is.nan(di_mean)]       <- NA_real_
+    fo_mean    <- rowMeans(fo_rep_cols,    na.rm = TRUE); fo_mean[is.nan(fo_mean)]       <- NA_real_
+    faims_mean <- rowMeans(faims_rep_cols, na.rm = TRUE); faims_mean[is.nan(faims_mean)] <- NA_real_
+    
+    di_cov    <- rep_cov_is(DI_IS_mat,          paste0("^", s, "_rep"))
+    fo_cov    <- rep_cov_is(FO_IS_mat,           paste0("^", s, "_rep"))
+    faims_cov <- rep_cov_is(FAIMS_IS_bestcv_mat, paste0("^", s, "_FAIMS_bestCV_rep"))
+    
+    cond_means <- cbind(DI       = di_mean,
+                        FAIMSoff = if (has_FAIMSoff) fo_mean else NA_real_,
+                        FAIMS    = faims_mean)
+    best_cond <- apply(cond_means, 1, function(x) {
+      x[is.nan(x)] <- NA
+      if (all(is.na(x))) return(NA_character_)
+      conditions_excel[which.max(x)]
+    })
+    
+    di_vs_fo    <- if (has_FAIMSoff) pairwise_stats_is(di_rep_cols, fo_rep_cols)
+    else list(log2fc = rep(NA_real_, n_is), pval = rep(NA_real_, n_is))
+    di_vs_faims <- pairwise_stats_is(di_rep_cols, faims_rep_cols)
+    faims_vs_fo <- if (has_FAIMSoff) pairwise_stats_is(faims_rep_cols, fo_rep_cols)
+    else list(log2fc = rep(NA_real_, n_is), pval = rep(NA_real_, n_is))
+    
+    out <- data.frame(IS_lipid_name = all_is_labels,
+                      IS_lipid_mz   = round(theo_mz_vec, 5),
+                      stringsAsFactors = FALSE)
+    
+    di_rep_df <- as.data.frame(di_rep_cols)
+    colnames(di_rep_df) <- paste0("DI_rep", seq_len(n_replicates))
+    out <- cbind(out, di_rep_df)
+    
+    if (has_FAIMSoff) {
+      fo_rep_df <- as.data.frame(fo_rep_cols)
+      colnames(fo_rep_df) <- paste0("FAIMSoff_rep", seq_len(n_replicates))
+      out <- cbind(out, fo_rep_df)
+    }
+    
+    faims_rep_df <- as.data.frame(faims_rep_cols)
+    colnames(faims_rep_df) <- paste0("FAIMS_bestCV_rep", seq_len(n_replicates))
+    out <- cbind(out, faims_rep_df)
+    out$FAIMS_best_CV <- best_cv_is[all_is_labels, s]
+    
+    out$mean_DI    <- round(di_mean, 1)
+    if (has_FAIMSoff) out$mean_FAIMSoff <- round(fo_mean, 1)
+    out$mean_FAIMS <- round(faims_mean, 1)
+    
+    out$CoV_pct_DI    <- round(di_cov,    2)
+    if (has_FAIMSoff) out$CoV_pct_FAIMSoff <- round(fo_cov, 2)
+    out$CoV_pct_FAIMS <- round(faims_cov, 2)
+    
+    out$mz_DI   <- round(mz_ppm_DI$mz,   5); out$ppm_DI   <- round(mz_ppm_DI$ppm,   4)
+    if (has_FAIMSoff) {
+      out$mz_FAIMSoff  <- round(mz_ppm_FO$mz,  5)
+      out$ppm_FAIMSoff <- round(mz_ppm_FO$ppm, 4)
+    }
+    out$mz_FAIMS  <- round(mz_ppm_FAIMS$mz,  5)
+    out$ppm_FAIMS <- round(mz_ppm_FAIMS$ppm, 4)
+    
+    out$best_condition               <- best_cond
+    out$log2FC_FAIMSoff_vs_DI        <- di_vs_fo$log2fc
+    out$log2FC_FAIMS_vs_DI           <- di_vs_faims$log2fc
+    out$log2FC_FAIMSoff_vs_FAIMS     <- faims_vs_fo$log2fc
+    out$pval_ttest_FAIMSoff_vs_DI    <- di_vs_fo$pval
+    out$pval_ttest_FAIMS_vs_DI       <- di_vs_faims$pval
+    out$pval_ttest_FAIMSoff_vs_FAIMS <- faims_vs_fo$pval
+    
+    wb_s <- createWorkbook()
+    addWorksheet(wb_s, "IS_results")
+    writeData(wb_s, "IS_results", out)
+    addStyle(wb_s, "IS_results",
+             createStyle(fontName = "Arial", fontSize = 11, fontColour = "#FFFFFF",
+                         fgFill = "#2F5496", halign = "CENTER",
+                         textDecoration = "Bold", wrapText = TRUE),
+             rows = 1, cols = 1:ncol(out), gridExpand = TRUE)
+    
+    cov_col_map <- list(
+      CoV_pct_DI       = list(green = cov_green_DI,       yellow = cov_yellow_DI),
+      CoV_pct_FAIMSoff = list(green = cov_green_FAIMSoff, yellow = cov_yellow_FAIMSoff),
+      CoV_pct_FAIMS    = list(green = cov_green_FAIMS,    yellow = cov_yellow_FAIMS))
+    for (cn in intersect(names(cov_col_map), colnames(out))) {
+      color_cov_column(wb_s, "IS_results", which(colnames(out) == cn), out[[cn]],
+                       cov_col_map[[cn]]$green, cov_col_map[[cn]]$yellow)
+    }
+    for (pc in grep("^pval_", colnames(out), value = TRUE)) {
+      idx <- which(colnames(out) == pc)
+      sig_rows <- which(!is.na(out[[pc]]) & out[[pc]] < 0.05)
+      if (length(sig_rows))
+        addStyle(wb_s, "IS_results", createStyle(fgFill = "#C6EFCE"),
+                 rows = sig_rows + 1, cols = idx, gridExpand = TRUE, stack = TRUE)
+    }
+    for (fc in grep("^log2FC_", colnames(out), value = TRUE)) {
+      idx <- which(colnames(out) == fc)
+      sig_rows <- which(!is.na(out[[fc]]) & abs(out[[fc]]) > 1)
+      if (length(sig_rows))
+        addStyle(wb_s, "IS_results", createStyle(fgFill = "#FCE4D6"),
+                 rows = sig_rows + 1, cols = idx, gridExpand = TRUE, stack = TRUE)
+    }
+    freezePane(wb_s, "IS_results", firstRow = TRUE)
+    setColWidths(wb_s, "IS_results", cols = 1:ncol(out),
+                 widths = c(30, 14, rep(12, ncol(out) - 2)))
+    
+    out_file_s <- sub("\\.xlsx$", sprintf("_IS_output_%s.xlsx", s), file_output)
+    saveWorkbook(wb_s, out_file_s, overwrite = TRUE)
+    cat(sprintf("  %s: %d IS lipids written to %s\n", s, n_is, out_file_s))
+  }
+  
+} # end if (has_IS_ref)
+
+cat("\n=== Pipeline complete ===\n")
