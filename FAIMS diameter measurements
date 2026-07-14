@@ -1,0 +1,946 @@
+# =============================================================================
+# Two-Sample DI vs FAIMS Lipidomics Comparison Pipeline
+# -----------------------------------------------------------------------------
+# Input  : Two samples, each with their own blank (one DI file + one FAIMS
+#          file per measurement session). Column layout in each Excel file:
+#
+#          DI   : mz | blank1_rep1..n | blank1_rep2..n | sample1_rep1..n |
+#                     | blank2_rep1..n | sample2_rep1..n
+#          FAIMS: mz | blank1_CV-15_rep1..n | ... | blank1_CV-40_rep1..n |
+#                     | sample1_CV-15_rep1..n | ... |
+#                     | blank2_CV-15_rep1..n | ... | sample2_CV-15_rep1..n ...
+#
+# Each sample is blank-subtracted with its OWN blank, IS-matched, then
+# combined for comparison across sample × condition (DI / FAIMS).
+#
+# Outputs:
+#   Boxplots  : per-lipid (S1-DI, S1-FAIMS, S2-DI, S2-FAIMS) and abundance
+#               spread (same four groups)
+#   Heatmaps  : S1 DI vs FAIMS best-CV; S1 DI vs FAIMS all-CVs (grey=below
+#               threshold); S2 DI vs FAIMS best-CV; S2 DI vs FAIMS all-CVs
+#   Excel     : 25-column comparison table (see header comments below)
+# =============================================================================
+
+
+# =============================================================================
+# SECTION 1 — USER SETTINGS
+# =============================================================================
+
+mode     <- "pos"   # "pos" or "neg"
+data_dir <- "G:/Practice dataset R/20260504_SM_diameter"
+
+# ---------------------------------------------------------------------------
+# Sample names — exactly two; order must match the column layout in the
+# Excel files (Sample 1 first, Sample 2 second).
+# ---------------------------------------------------------------------------
+sample1_name <- "5 um"
+sample2_name <- "10 um"
+
+# ---------------------------------------------------------------------------
+# CV values used in FAIMS.
+# ---------------------------------------------------------------------------
+cv_values_user <- c(-25, -30, -35, -40)
+
+# ---------------------------------------------------------------------------
+# Number of replicates per sample per condition.
+# ---------------------------------------------------------------------------
+n_replicates <- 3
+
+# ---------------------------------------------------------------------------
+# Filters
+# ---------------------------------------------------------------------------
+abundance_threshold <- 50000   # minimum mean abundance to pass
+fc_threshold        <- 3       # minimum sample/blank fold-change
+missingness_count   <- 2       # drop if >= this many replicates are zero
+
+# ---------------------------------------------------------------------------
+# CoV thresholds (%)
+# ---------------------------------------------------------------------------
+cov_green  <- 30   # < 30 % → green
+cov_yellow <- 50   # 30–50 % → yellow, > 50 % → red
+
+# Grey-out threshold for the all-CVs heatmap: cells whose mean abundance
+# is below this value are rendered grey.
+grey_abundance_threshold <- abundance_threshold
+
+# ---------------------------------------------------------------------------
+# Set TRUE to actually remove rows exceeding CoV thresholds; FALSE = flag only
+# ---------------------------------------------------------------------------
+filter_high_cov <- FALSE
+
+# ---------------------------------------------------------------------------
+# Pareto scaling in heatmaps (TRUE = log2 + Pareto; FALSE = log2 only)
+# ---------------------------------------------------------------------------
+pareto_scaling <- TRUE
+
+# ---------------------------------------------------------------------------
+# FAIMS di table log2 FC threshold for colour highlight
+# ---------------------------------------------------------------------------
+faims_di_fc_threshold <- 1   # |log2FC| > 1 → highlight green
+
+
+# =============================================================================
+# SECTION 2 — MODE-SPECIFIC FILE PATHS
+# =============================================================================
+
+if (mode == "pos") {
+  file_DI    <- file.path(data_dir, "DI_positive_20260504.xlsx")
+  file_FAIMS <- file.path(data_dir, "FAIMS_positive_20260504.xlsx")
+  file_IS    <- file.path(data_dir, "pos_internal_standards.xlsx")
+  cv_values  <- cv_values_user
+} else if (mode == "neg") {
+  file_DI    <- file.path(data_dir, "DI_negative_20260504.xlsx")
+  file_FAIMS <- file.path(data_dir, "FAIMS_negative_20260504.xlsx")
+  file_IS    <- file.path(data_dir, "neg_internal_standards.xlsx")
+  cv_values  <- cv_values_user
+} else stop("mode must be 'pos' or 'neg'")
+
+setwd(data_dir)
+
+# =============================================================================
+# SECTION 3 — PACKAGES
+# =============================================================================
+
+library(readxl)
+library(dplyr)
+library(tidyr)
+library(openxlsx)
+library(ggplot2)
+library(patchwork)
+
+# =============================================================================
+# SECTION 4 — DERIVED CONSTANTS
+# =============================================================================
+
+n_cv         <- length(cv_values)
+cv_labels    <- paste0("CV", cv_values)
+sample_names <- c(sample1_name, sample2_name)
+
+cat(sprintf("\n=== Two-Sample DI vs FAIMS | %s mode ===\n", toupper(mode)))
+cat(sprintf("  Sample 1: %s\n  Sample 2: %s\n", sample1_name, sample2_name))
+cat(sprintf("  CV values: %s\n", paste(cv_labels, collapse = ", ")))
+cat(sprintf("  Replicates: %d | Abundance threshold: %s | FC threshold: %s\n\n",
+            n_replicates,
+            format(abundance_threshold, big.mark = ","),
+            fc_threshold))
+
+# =============================================================================
+# SECTION 5 — HELPER FUNCTIONS
+# =============================================================================
+
+count_zeros <- function(df, cols) {
+  rowSums(df[, cols, drop = FALSE] == 0, na.rm = TRUE)
+}
+
+# IS matching: ±3 ppm
+match_is <- function(df, is_df) {
+  bind_rows(lapply(seq_len(nrow(df)), function(i) {
+    ppm_errors <- ((df$mz[i] - is_df$is_mz) / is_df$is_mz) * 1e6
+    hits <- which(abs(ppm_errors) <= 3)
+    if (!length(hits)) return(NULL)
+    bind_rows(lapply(hits, function(h)
+      cbind(is_name = is_df$is_name[h], df[i, , drop = FALSE],
+            ppm_error = ppm_errors[h])))
+  }))
+}
+
+# Pareto scaling per row
+pareto_scale <- function(mat) {
+  out <- t(apply(mat, 1, function(x) {
+    mu  <- mean(x, na.rm = TRUE)
+    sig <- sd(x,   na.rm = TRUE)
+    if (is.na(mu) || is.na(sig) || sig == 0) return(x - mu)
+    (x - mu) / sqrt(sig)
+  }))
+  colnames(out) <- colnames(mat)
+  out
+}
+
+run_ttest <- function(x, y) {
+  x <- as.numeric(x[!is.na(x)]); y <- as.numeric(y[!is.na(y)])
+  if (length(x) < 2 || length(y) < 2) return(NA_real_)
+  alt <- if (mean(x) > mean(y)) "greater" else "less"
+  tryCatch(t.test(x, y, alternative = alt, var.equal = FALSE)$p.value,
+           error = function(e) NA_real_)
+}
+
+sig_label <- function(p) {
+  if (is.na(p)) return("ns")
+  if (p < 0.001) return("***")
+  if (p < 0.01)  return("**")
+  if (p < 0.05)  return("*")
+  return("ns")
+}
+
+# CoV colour helper for openxlsx
+add_cov_colours <- function(wb, sheet, col_idx, vals, start_row = 2) {
+  for (i in seq_along(vals)) {
+    v <- vals[i]
+    fill <- if (is.na(v))           "#D3D3D3" else
+      if (v < cov_green)  "#00B050" else
+        if (v <= cov_yellow) "#FFFF00" else "#FF0000"
+    addStyle(wb, sheet, createStyle(fgFill = fill),
+             rows = start_row + i - 1, cols = col_idx, stack = TRUE)
+  }
+}
+
+add_pvalue_colours <- function(wb, sheet, col_idx, vals, start_row = 2) {
+  for (i in seq_along(vals)) {
+    fill <- if (!is.na(vals[i]) && vals[i] < 0.05) "#00B050" else "#FFFFFF"
+    addStyle(wb, sheet, createStyle(fgFill = fill),
+             rows = start_row + i - 1, cols = col_idx, stack = TRUE)
+  }
+}
+
+add_log2fc_colours <- function(wb, sheet, col_idx, vals, threshold = 1,
+                               start_row = 2) {
+  for (i in seq_along(vals)) {
+    v <- vals[i]
+    fill <- if (is.na(v))            "#D3D3D3" else
+      if (v >  threshold)  "#00B050" else
+        if (v < -threshold)  "#FF0000" else "#FFFFFF"
+    addStyle(wb, sheet, createStyle(fgFill = fill),
+             rows = start_row + i - 1, cols = col_idx, stack = TRUE)
+  }
+}
+
+
+# =============================================================================
+# SECTION 6 — LOAD IS REFERENCE
+# =============================================================================
+
+is_ref <- read_excel(file_IS)
+colnames(is_ref)[1:2] <- c("is_name", "is_mz")
+is_ref$is_mz <- as.numeric(is_ref$is_mz)
+is_ref <- is_ref[!is.na(is_ref$is_mz), ]
+cat("IS reference loaded:", nrow(is_ref), "entries\n\n")
+
+
+# =============================================================================
+# SECTION 7 — COLUMN NAME BLUEPRINTS
+# =============================================================================
+# DI layout  : mz | blank1_1..n | sample1_1..n | blank2_1..n | sample2_1..n
+# FAIMS layout: mz | blank1_CV-15_rep1..n | ... | blank1_CV-40_rep1..n
+#                  | sample1_CV-15_rep1..n | ... | sample2_CV-15_rep1..n ...
+
+make_di_cols <- function(prefix) paste0(prefix, "_", seq_len(n_replicates))
+
+DI_blank1_cols  <- make_di_cols(paste0(sample1_name, "_blank"))
+DI_sample1_cols <- make_di_cols(sample1_name)
+DI_blank2_cols  <- make_di_cols(paste0(sample2_name, "_blank"))
+DI_sample2_cols <- make_di_cols(sample2_name)
+DI_all_cols     <- c(DI_blank1_cols, DI_sample1_cols, DI_blank2_cols, DI_sample2_cols)
+
+make_faims_cv_cols <- function(prefix)
+  lapply(cv_labels, function(cv)
+    paste0(prefix, "_", cv, "_rep", seq_len(n_replicates)))
+
+FAIMS_blank1_by_CV  <- make_faims_cv_cols(paste0(sample1_name, "_blank"))
+FAIMS_sample1_by_CV <- make_faims_cv_cols(sample1_name)
+FAIMS_blank2_by_CV  <- make_faims_cv_cols(paste0(sample2_name, "_blank"))
+FAIMS_sample2_by_CV <- make_faims_cv_cols(sample2_name)
+
+FAIMS_all_cols <- c(
+  unlist(FAIMS_blank1_by_CV),  unlist(FAIMS_sample1_by_CV),
+  unlist(FAIMS_blank2_by_CV),  unlist(FAIMS_sample2_by_CV)
+)
+
+
+# =============================================================================
+# SECTION 8 — DI PIPELINE (per-sample blank subtraction → IS matching)
+# =============================================================================
+
+run_di_pipeline <- function(raw_df, sample_cols, blank_cols, sample_label) {
+  cat(sprintf("--- DI %s ---\n", sample_label))
+  
+  # Filter 1: Missingness
+  df <- raw_df[count_zeros(raw_df, sample_cols) < missingness_count, ]
+  cat(sprintf("  After missingness filter: %d / %d\n", nrow(df), nrow(raw_df)))
+  
+  # Filter 2: Abundance
+  df <- df %>% mutate(across(all_of(sample_cols), as.numeric))
+  df$.mean_sm <- rowMeans(df[, sample_cols, drop = FALSE], na.rm = TRUE)
+  df <- df[df$.mean_sm >= abundance_threshold, ]
+  cat(sprintf("  After abundance filter  : %d\n", nrow(df)))
+  
+  # Filter 3: Fold change vs own blank
+  df$.mean_bl <- rowMeans(df[, blank_cols, drop = FALSE], na.rm = TRUE)
+  df <- df[(df$.mean_sm + 1) / (df$.mean_bl + 1) >= fc_threshold, ]
+  cat(sprintf("  After FC filter         : %d\n", nrow(df)))
+  
+  # CoV
+  df$.sd_sm  <- apply(df[, sample_cols, drop = FALSE], 1, sd, na.rm = TRUE)
+  df$.cov    <- df$.sd_sm / df$.mean_sm * 100
+  
+  if (filter_high_cov) {
+    n_before <- nrow(df)
+    df <- df[is.na(df$.cov) | df$.cov <= cov_yellow, ]
+    cat(sprintf("  After CoV filter        : %d (removed %d)\n", nrow(df), n_before - nrow(df)))
+  }
+  
+  # IS matching
+  df_is <- match_is(df, is_ref)
+  cat(sprintf("  IS-matched              : %d rows\n\n", nrow(df_is)))
+  list(filtered = df, is_matched = df_is)
+}
+
+DI_raw <- read_excel(file_DI)
+colnames(DI_raw) <- c("mz", DI_all_cols)
+DI_raw[, -1] <- lapply(DI_raw[, -1], as.numeric)
+
+di1 <- run_di_pipeline(DI_raw, DI_sample1_cols, DI_blank1_cols, sample1_name)
+di2 <- run_di_pipeline(DI_raw, DI_sample2_cols, DI_blank2_cols, sample2_name)
+
+DI_IS1 <- di1$is_matched
+DI_IS2 <- di2$is_matched
+
+
+# =============================================================================
+# SECTION 9 — FAIMS PIPELINE (per-sample blank subtraction → IS matching)
+# =============================================================================
+
+run_faims_pipeline <- function(raw_df, sample_by_CV, blank_by_CV, sample_label) {
+  cat(sprintf("--- FAIMS %s ---\n", sample_label))
+  
+  # Filter 1: Missingness (pass if any CV has < missingness_count zeros)
+  miss_ok <- do.call(cbind, lapply(seq_along(cv_labels), function(i)
+    count_zeros(raw_df, sample_by_CV[[i]]) < missingness_count))
+  df <- raw_df[rowSums(miss_ok) >= 1, ]
+  cat(sprintf("  After missingness filter: %d / %d\n", nrow(df), nrow(raw_df)))
+  
+  # Filter 2: Abundance (pass if any CV mean >= threshold)
+  abun_ok <- do.call(cbind, lapply(seq_along(cv_labels), function(i)
+    rowMeans(df[, sample_by_CV[[i]], drop = FALSE], na.rm = TRUE) >= abundance_threshold))
+  df <- df[rowSums(abun_ok) >= 1, ]
+  cat(sprintf("  After abundance filter  : %d\n", nrow(df)))
+  
+  # Filter 3: FC per CV vs own blank
+  fc_ok <- do.call(cbind, lapply(seq_along(cv_labels), function(i) {
+    ms <- rowMeans(df[, sample_by_CV[[i]], drop = FALSE], na.rm = TRUE)
+    mb <- rowMeans(df[, blank_by_CV[[i]],  drop = FALSE], na.rm = TRUE)
+    (ms + 1) / (mb + 1) >= fc_threshold
+  }))
+  df <- df[rowSums(fc_ok) >= 1, ]
+  cat(sprintf("  After FC filter         : %d\n", nrow(df)))
+  
+  # Per-CV mean and CoV
+  for (i in seq_along(cv_labels)) {
+    mn <- rowMeans(df[, sample_by_CV[[i]], drop = FALSE], na.rm = TRUE)
+    sd_i <- apply(df[, sample_by_CV[[i]], drop = FALSE], 1, sd, na.rm = TRUE)
+    df[[paste0(".mean_", cv_labels[i])]] <- mn
+    df[[paste0(".cov_",  cv_labels[i])]] <- sd_i / mn * 100
+  }
+  
+  if (filter_high_cov) {
+    cov_cols_tmp <- paste0(".cov_", cv_labels)
+    # Keep row if at least one CV has acceptable CoV
+    any_ok <- rowSums(sapply(cov_cols_tmp, function(cn)
+      is.na(df[[cn]]) | df[[cn]] <= cov_yellow)) > 0
+    n_before <- nrow(df)
+    df <- df[any_ok, ]
+    cat(sprintf("  After CoV filter        : %d (removed %d)\n", nrow(df), n_before - nrow(df)))
+  }
+  
+  df_is <- match_is(df, is_ref)
+  cat(sprintf("  IS-matched              : %d rows\n\n", nrow(df_is)))
+  list(filtered = df, is_matched = df_is)
+}
+
+FAIMS_raw <- read_excel(file_FAIMS)
+colnames(FAIMS_raw) <- c("mz", FAIMS_all_cols)
+FAIMS_raw[, -1] <- lapply(FAIMS_raw[, -1], as.numeric)
+
+fa1 <- run_faims_pipeline(FAIMS_raw, FAIMS_sample1_by_CV, FAIMS_blank1_by_CV, sample1_name)
+fa2 <- run_faims_pipeline(FAIMS_raw, FAIMS_sample2_by_CV, FAIMS_blank2_by_CV, sample2_name)
+
+FAIMS_IS1 <- fa1$is_matched
+FAIMS_IS2 <- fa2$is_matched
+
+
+# =============================================================================
+# SECTION 10 — BEST CV PER LIPID (for FAIMS IS tables)
+# =============================================================================
+
+best_cv_info <- function(is_df, sample_by_CV, label) {
+  # Returns a named list with:
+  #   $best_cv   — character vector of best cv_label per row
+  #   $best_mean — numeric vector of best-CV mean abundance per row
+  #   $best_reps — list of replicate vectors for the best CV
+  means_mat <- do.call(cbind, lapply(seq_along(cv_labels), function(i) {
+    cols <- intersect(sample_by_CV[[i]], colnames(is_df))
+    rowMeans(is_df[, cols, drop = FALSE], na.rm = TRUE)
+  }))
+  best_idx  <- apply(means_mat, 1, which.max)
+  best_cv   <- cv_labels[best_idx]
+  best_mean <- apply(means_mat, 1, max, na.rm = TRUE)
+  best_reps <- lapply(seq_len(nrow(is_df)), function(i) {
+    cols <- intersect(sample_by_CV[[best_idx[i]]], colnames(is_df))
+    as.numeric(is_df[i, cols])
+  })
+  list(best_cv = best_cv, best_mean = best_mean, best_reps = best_reps)
+}
+
+bv1 <- best_cv_info(FAIMS_IS1, FAIMS_sample1_by_CV, sample1_name)
+bv2 <- best_cv_info(FAIMS_IS2, FAIMS_sample2_by_CV, sample2_name)
+
+
+# =============================================================================
+# SECTION 11 — BOXPLOT A: Per-lipid — S1-DI, S1-FAIMS, S2-DI, S2-FAIMS
+# =============================================================================
+
+cat("Building long data for boxplots...\n")
+
+# Helper: get best-CV replicates from FAIMS IS df, per lipid
+get_faims_best_long <- function(is_df, bv, condition_label, sample_label) {
+  lapply(seq_len(nrow(is_df)), function(i) {
+    reps <- bv$best_reps[[i]]
+    data.frame(
+      is_name   = is_df$is_name[i],
+      abundance = reps,
+      condition = condition_label,
+      sample    = sample_label,
+      group     = paste(sample_label, condition_label),
+      stringsAsFactors = FALSE
+    )
+  }) |> bind_rows()
+}
+
+get_di_long <- function(is_df, sample_cols, condition_label, sample_label) {
+  bind_rows(lapply(seq_len(nrow(is_df)), function(i) {
+    cols <- intersect(sample_cols, colnames(is_df))
+    reps <- as.numeric(is_df[i, cols])
+    data.frame(
+      is_name   = is_df$is_name[i],
+      abundance = reps,
+      condition = condition_label,
+      sample    = sample_label,
+      group     = paste(sample_label, condition_label),
+      stringsAsFactors = FALSE
+    )
+  }))
+}
+
+long_all <- bind_rows(
+  get_di_long(DI_IS1,    DI_sample1_cols, "DI",    sample1_name),
+  get_faims_best_long(FAIMS_IS1, bv1, "FAIMS", sample1_name),
+  get_di_long(DI_IS2,    DI_sample2_cols, "DI",    sample2_name),
+  get_faims_best_long(FAIMS_IS2, bv2, "FAIMS", sample2_name)
+) %>%
+  filter(!is.na(abundance), abundance > 0) %>%
+  mutate(log10_abu = log10(abundance),
+         group = factor(group, levels = c(
+           paste(sample1_name, "DI"),    paste(sample1_name, "FAIMS"),
+           paste(sample2_name, "DI"),    paste(sample2_name, "FAIMS")
+         )))
+
+group_colours <- setNames(
+  c("#4472C4", "#70B0FF", "#ED7D31", "#FFB070"),
+  levels(long_all$group)
+)
+
+plots_per_page <- 6
+lipid_list <- sort(unique(long_all$is_name))
+n_pages    <- ceiling(length(lipid_list) / plots_per_page)
+group_levels <- levels(long_all$group)
+
+pdf(file.path(data_dir, sprintf("boxplot_per_lipid_S1S2_%s.pdf", mode)),
+    width = 14, height = 9)
+for (pg in seq_len(n_pages)) {
+  lip_sub <- lipid_list[((pg-1)*plots_per_page+1):min(pg*plots_per_page, length(lipid_list))]
+  pl <- lapply(lip_sub, function(lip) {
+    df_l <- long_all %>% filter(is_name == lip)
+    y_max <- max(df_l$log10_abu, na.rm = TRUE)
+    y_stp <- max(diff(range(df_l$log10_abu, na.rm = TRUE)) * 0.12, 0.1)
+    ggplot(df_l, aes(x = group, y = log10_abu, fill = group)) +
+      geom_boxplot(outlier.size = 0.5, width = 0.55, alpha = 0.85) +
+      geom_jitter(width = 0.12, size = 0.8, alpha = 0.5) +
+      scale_fill_manual(values = group_colours) +
+      labs(title = lip, x = NULL, y = "log10(abu)") +
+      theme_minimal(base_size = 9) +
+      theme(legend.position = "none",
+            axis.text.x = element_text(angle = 30, hjust = 1),
+            plot.title  = element_text(size = 8, face = "bold"))
+  })
+  while (length(pl) < plots_per_page) pl <- c(pl, list(ggplot() + theme_void()))
+  print(wrap_plots(pl, ncol = 3))
+}
+dev.off()
+cat("Boxplot A (per-lipid) saved\n")
+
+
+# =============================================================================
+# SECTION 12 — BOXPLOT B: Abundance spread across all IS lipids
+# =============================================================================
+
+p_spread <- ggplot(long_all, aes(x = group, y = log10_abu, fill = group)) +
+  geom_boxplot(outlier.size = 0.8, width = 0.55, alpha = 0.85) +
+  geom_jitter(width = 0.15, size = 0.7, alpha = 0.35) +
+  scale_fill_manual(values = group_colours) +
+  labs(title = sprintf("IS lipid abundance spread — %s mode", toupper(mode)),
+       x = NULL, y = "log10(abundance)") +
+  theme_minimal(base_size = 12) +
+  theme(legend.position = "none",
+        axis.text.x = element_text(angle = 25, hjust = 1))
+
+ggsave(file.path(data_dir, sprintf("boxplot_abundance_spread_%s.pdf", mode)),
+       p_spread, width = 7, height = 6)
+ggsave(file.path(data_dir, sprintf("boxplot_abundance_spread_%s.png", mode)),
+       p_spread, width = 7, height = 6, dpi = 200)
+cat("Boxplot B (abundance spread) saved\n")
+
+
+# =============================================================================
+# SECTION 13 — HEATMAP HELPERS
+# =============================================================================
+
+make_di_faims_heatmap <- function(is_di, di_sample_cols,
+                                  is_faims, faims_sample_by_CV,
+                                  bv,
+                                  sample_label,
+                                  best_cv_only = TRUE,
+                                  grey_threshold = grey_abundance_threshold) {
+  
+  all_lipids <- sort(unique(c(is_di$is_name, is_faims$is_name)))
+  if (length(all_lipids) == 0) {
+    cat("  No IS lipids found — heatmap skipped.\n"); return(invisible(NULL))
+  }
+  
+  if (best_cv_only) {
+    # Columns: DI reps | FAIMS-best-CV reps
+    col_labels <- c(paste0("DI_rep", seq_len(n_replicates)),
+                    paste0("FAIMS_best_rep", seq_len(n_replicates)))
+    mat <- matrix(NA_real_, nrow = length(all_lipids), ncol = length(col_labels),
+                  dimnames = list(all_lipids, col_labels))
+    avail <- matrix(TRUE,  nrow = length(all_lipids), ncol = length(col_labels),
+                    dimnames = list(all_lipids, col_labels))
+    
+    for (lip in all_lipids) {
+      # DI
+      row_di <- which(is_di$is_name == lip)
+      if (length(row_di)) {
+        cols <- intersect(di_sample_cols, colnames(is_di))
+        mat[lip, paste0("DI_rep", seq_len(n_replicates))] <-
+          as.numeric(is_di[row_di[1], cols])
+      } else {
+        avail[lip, paste0("DI_rep", seq_len(n_replicates))] <- FALSE
+      }
+      # FAIMS best CV
+      row_fa <- which(is_faims$is_name == lip)
+      if (length(row_fa)) {
+        mat[lip, paste0("FAIMS_best_rep", seq_len(n_replicates))] <-
+          bv$best_reps[[row_fa[1]]]
+      } else {
+        avail[lip, paste0("FAIMS_best_rep", seq_len(n_replicates))] <- FALSE
+      }
+    }
+    block_sizes <- c(n_replicates, n_replicates)
+    x_labels <- c(paste0("DI Rep ", seq_len(n_replicates)),
+                  paste0("FAIMS Best-CV Rep ", seq_len(n_replicates)))
+  } else {
+    # Columns: DI reps | CV1 reps | CV2 reps | ...
+    cv_block_cols <- unlist(lapply(cv_labels, function(cv)
+      paste0("FAIMS_", cv, "_rep", seq_len(n_replicates))))
+    col_labels <- c(paste0("DI_rep", seq_len(n_replicates)), cv_block_cols)
+    x_labels   <- c(paste0("DI Rep ",   seq_len(n_replicates)),
+                    unlist(lapply(cv_labels, function(cv)
+                      paste0(cv, " Rep ", seq_len(n_replicates)))))
+    mat  <- matrix(NA_real_, nrow = length(all_lipids), ncol = length(col_labels),
+                   dimnames = list(all_lipids, col_labels))
+    avail <- matrix(TRUE, nrow = length(all_lipids), ncol = length(col_labels),
+                    dimnames = list(all_lipids, col_labels))
+    
+    for (lip in all_lipids) {
+      row_di <- which(is_di$is_name == lip)
+      if (length(row_di)) {
+        cols <- intersect(di_sample_cols, colnames(is_di))
+        mat[lip, paste0("DI_rep", seq_len(n_replicates))] <-
+          as.numeric(is_di[row_di[1], cols])
+      } else {
+        avail[lip, paste0("DI_rep", seq_len(n_replicates))] <- FALSE
+      }
+      row_fa <- which(is_faims$is_name == lip)
+      for (i in seq_along(cv_labels)) {
+        cv_cols_out <- paste0("FAIMS_", cv_labels[i], "_rep", seq_len(n_replicates))
+        if (length(row_fa)) {
+          cols_in <- intersect(faims_sample_by_CV[[i]], colnames(is_faims))
+          vals    <- as.numeric(is_faims[row_fa[1], cols_in])
+          mat[lip, cv_cols_out] <- vals
+          # Grey out if mean abundance is below threshold
+          if (!is.na(mean(vals, na.rm = TRUE)) &&
+              mean(vals, na.rm = TRUE) < grey_threshold)
+            avail[lip, cv_cols_out] <- FALSE
+        } else {
+          avail[lip, cv_cols_out] <- FALSE
+        }
+      }
+    }
+    block_sizes <- c(n_replicates, rep(n_replicates, n_cv))
+  }
+  
+  # Scale
+  mat_log <- log2(mat); mat_log[!is.finite(mat_log)] <- NA
+  mat_imp <- mat_log
+  for (i in seq_len(nrow(mat_imp))) {
+    na_i <- is.na(mat_imp[i, ])
+    if (any(na_i)) mat_imp[i, na_i] <- median(mat_imp[i, ], na.rm = TRUE)
+  }
+  mat_imp[!is.finite(mat_imp)] <- 0
+  scaled <- if (pareto_scaling) pareto_scale(mat_imp) else mat_imp
+  colnames(scaled) <- col_labels
+  
+  # Row order by clustering
+  row_ord <- tryCatch(
+    rownames(scaled)[hclust(dist(scaled), method = "complete")$order],
+    error = function(e) rownames(scaled)
+  )
+  
+  # Long format
+  long_h <- data.frame(
+    y_label = rep(rownames(scaled), times = ncol(scaled)),
+    x_label = rep(x_labels,         each  = nrow(scaled)),
+    value   = as.vector(scaled),
+    avail   = as.vector(avail)
+  ) %>%
+    mutate(
+      value   = ifelse(avail, value, NA_real_),
+      x_label = factor(x_label, levels = x_labels),
+      y_label = factor(y_label, levels = rev(row_ord))
+    )
+  
+  x_sep <- cumsum(block_sizes)
+  x_sep <- x_sep[-length(x_sep)] + 0.5
+  sl    <- max(abs(range(long_h$value, na.rm = TRUE)), na.rm = TRUE)
+  mc    <- c("#00008B","#0000FF","#4169E1","#87CEEB","#FFFFFF",
+             "#FFB6C1","#FF4500","#FF0000","#8B0000")
+  ph    <- max(6, length(all_lipids) * 0.30)
+  pw    <- length(col_labels) * 0.55 + 4
+  
+  type_tag <- if (best_cv_only) "best_CV" else "all_CVs"
+  subtitle <- paste0(
+    if (pareto_scaling) "log2 | Pareto scaled" else "log2 | no scaling",
+    if (!best_cv_only) sprintf(" | grey = mean abundance < %s",
+                               format(grey_threshold, big.mark = ",")) else "",
+    " | grey = not detected | rows clustered"
+  )
+  
+  p <- ggplot(long_h, aes(x = x_label, y = y_label, fill = value)) +
+    geom_tile(colour = "white", linewidth = 0.25) +
+    { lapply(x_sep, function(xs)
+      geom_vline(xintercept = xs, colour = "grey30", linewidth = 0.8)) } +
+    scale_fill_gradientn(colours = mc, limits = c(-sl, sl), na.value = "grey85",
+                         name = if (pareto_scaling) "Pareto-scaled\nlog2" else "log2(abundance)") +
+    scale_x_discrete(position = "top") +
+    scale_y_discrete(expand = c(0, 0)) +
+    labs(title    = sprintf("IS lipid heatmap — %s | %s (%s mode)",
+                            sample_label, type_tag, toupper(mode)),
+         subtitle = subtitle,
+         x = NULL, y = "IS lipid") +
+    theme_minimal(base_size = 10) +
+    theme(axis.text.x       = element_text(angle = 40, hjust = 0, vjust = 0, size = 9),
+          axis.text.y       = element_text(size = 8),
+          legend.key.height = unit(1.5, "cm"),
+          panel.grid        = element_blank(),
+          plot.title        = element_text(face = "bold"))
+  
+  out_stem <- file.path(data_dir,
+                        sprintf("heatmap_%s_%s_%s", sample_label, type_tag, mode))
+  ggsave(paste0(out_stem, ".pdf"), p, width = pw, height = ph, limitsize = FALSE)
+  ggsave(paste0(out_stem, ".png"), p, width = pw, height = ph,
+         limitsize = FALSE, dpi = 180)
+  cat(sprintf("  Heatmap saved: %s\n", basename(out_stem)))
+  invisible(p)
+}
+
+
+# =============================================================================
+# SECTION 14 — GENERATE FOUR HEATMAPS
+# =============================================================================
+
+cat("\nGenerating heatmaps...\n")
+make_di_faims_heatmap(DI_IS1, DI_sample1_cols, FAIMS_IS1, FAIMS_sample1_by_CV,
+                      bv1, sample1_name, best_cv_only = TRUE)
+make_di_faims_heatmap(DI_IS1, DI_sample1_cols, FAIMS_IS1, FAIMS_sample1_by_CV,
+                      bv1, sample1_name, best_cv_only = FALSE)
+make_di_faims_heatmap(DI_IS2, DI_sample2_cols, FAIMS_IS2, FAIMS_sample2_by_CV,
+                      bv2, sample2_name, best_cv_only = TRUE)
+make_di_faims_heatmap(DI_IS2, DI_sample2_cols, FAIMS_IS2, FAIMS_sample2_by_CV,
+                      bv2, sample2_name, best_cv_only = FALSE)
+
+
+# =============================================================================
+# SECTION 15 — EXCEL OUTPUT  (25 columns)
+# =============================================================================
+# Columns:
+#  1  Lipid name (IS name)
+#  2  Theoretical m/z
+#  3  m/z in Sample 1 DI
+#  4  ppm Sample 1 DI
+#  5  Mean abundance Sample 1 DI
+#  6  CoV Sample 1 DI   [colour]
+#  7  m/z in Sample 1 FAIMS
+#  8  ppm Sample 1 FAIMS
+#  9  Mean abundance best-CV Sample 1 FAIMS
+# 10  CoV best-CV Sample 1 FAIMS  [colour]
+# 11  m/z in Sample 2 DI
+# 12  ppm Sample 2 DI
+# 13  Mean abundance Sample 2 DI
+# 14  CoV Sample 2 DI  [colour]
+# 15  m/z in Sample 2 FAIMS
+# 16  ppm Sample 2 FAIMS
+# 17  Mean abundance best-CV Sample 2 FAIMS
+# 18  CoV best-CV Sample 2 FAIMS  [colour]
+# 19  log2 FC S1 vs S2 DI  [colour]
+# 20  log2 FC S1 vs S2 FAIMS best-CV  [colour]
+# 21  p-value t-test S1 vs S2 DI (one-sided, unequal var)  [colour]
+# 22  p-value t-test S1 vs S2 FAIMS best-CV  [colour]
+# 23  Highest abundance sample & condition
+# 24  Best CV Sample 1 FAIMS
+# 25  Best CV Sample 2 FAIMS
+
+cat("\nBuilding Excel comparison table...\n")
+
+all_is_lipids <- sort(unique(c(
+  DI_IS1$is_name, FAIMS_IS1$is_name,
+  DI_IS2$is_name, FAIMS_IS2$is_name
+)))
+
+get_di_row_info <- function(is_df, lipid, sample_cols) {
+  row_i <- which(is_df$is_name == lipid)
+  if (!length(row_i)) {
+    return(list(mz = NA_real_, ppm = NA_real_, mean_abu = NA_real_,
+                cov = NA_real_, reps = rep(NA_real_, n_replicates)))
+  }
+  r   <- row_i[1]
+  cols <- intersect(sample_cols, colnames(is_df))
+  reps <- as.numeric(is_df[r, cols])
+  mn   <- mean(reps, na.rm = TRUE)
+  sd_v <- sd(reps, na.rm = TRUE)
+  list(
+    mz      = if ("mz" %in% colnames(is_df)) is_df$mz[r] else NA_real_,
+    ppm     = if ("ppm_error" %in% colnames(is_df)) is_df$ppm_error[r] else NA_real_,
+    mean_abu = mn,
+    cov      = sd_v / mn * 100,
+    reps     = reps
+  )
+}
+
+get_faims_best_row_info <- function(is_df, lipid, bv) {
+  row_i <- which(is_df$is_name == lipid)
+  if (!length(row_i)) {
+    return(list(mz = NA_real_, ppm = NA_real_, mean_abu = NA_real_,
+                cov = NA_real_, best_cv = NA_character_,
+                reps = rep(NA_real_, n_replicates)))
+  }
+  r    <- row_i[1]
+  reps <- bv$best_reps[[r]]
+  mn   <- mean(reps, na.rm = TRUE)
+  sd_v <- sd(reps, na.rm = TRUE)
+  list(
+    mz       = if ("mz" %in% colnames(is_df)) is_df$mz[r] else NA_real_,
+    ppm      = if ("ppm_error" %in% colnames(is_df)) is_df$ppm_error[r] else NA_real_,
+    mean_abu  = mn,
+    cov       = sd_v / mn * 100,
+    best_cv   = bv$best_cv[r],
+    reps      = reps
+  )
+}
+
+rows_list <- lapply(all_is_lipids, function(lip) {
+  
+  # Theoretical m/z from IS reference
+  theo_mz <- is_ref$is_mz[match(lip, is_ref$is_name)]
+  
+  d1  <- get_di_row_info(DI_IS1,    lip, DI_sample1_cols)
+  f1  <- get_faims_best_row_info(FAIMS_IS1, lip, bv1)
+  d2  <- get_di_row_info(DI_IS2,    lip, DI_sample2_cols)
+  f2  <- get_faims_best_row_info(FAIMS_IS2, lip, bv2)
+  
+  # log2 FC  (S1 mean / S2 mean)
+  fc_di    <- log2((d1$mean_abu + 1) / (d2$mean_abu + 1))
+  fc_faims <- log2((f1$mean_abu + 1) / (f2$mean_abu + 1))
+  
+  # t-tests (one-sided, unequal var) — S1 vs S2, direction based on means
+  p_di    <- run_ttest(d1$reps, d2$reps)
+  p_faims <- run_ttest(f1$reps, f2$reps)
+  
+  # Within-sample DI vs FAIMS best-CV log2 FC and t-test
+  fc_s1_di_vs_faims <- log2((f1$mean_abu + 1) / (d1$mean_abu + 1))
+  p_s1_di_vs_faims  <- run_ttest(f1$reps, d1$reps)
+  fc_s2_di_vs_faims <- log2((f2$mean_abu + 1) / (d2$mean_abu + 1))
+  p_s2_di_vs_faims  <- run_ttest(f2$reps, d2$reps)
+  
+  # Highest abundance label
+  abu_vec <- c(d1$mean_abu, f1$mean_abu, d2$mean_abu, f2$mean_abu)
+  names(abu_vec) <- c(
+    paste(sample1_name, "DI"),   paste(sample1_name, "FAIMS"),
+    paste(sample2_name, "DI"),   paste(sample2_name, "FAIMS")
+  )
+  best_lbl <- if (all(is.na(abu_vec))) NA_character_ else
+    names(which.max(abu_vec))
+  
+  data.frame(
+    lipid_name              = lip,
+    theoretical_mz          = round(theo_mz, 5),
+    mz_S1_DI                = round(d1$mz, 5),
+    ppm_S1_DI               = round(d1$ppm, 3),
+    mean_abu_S1_DI          = round(d1$mean_abu, 0),
+    CoV_S1_DI               = round(d1$cov, 1),
+    mz_S1_FAIMS             = round(f1$mz, 5),
+    ppm_S1_FAIMS            = round(f1$ppm, 3),
+    mean_abu_S1_FAIMS_best  = round(f1$mean_abu, 0),
+    CoV_S1_FAIMS_best       = round(f1$cov, 1),
+    mz_S2_DI                = round(d2$mz, 5),
+    ppm_S2_DI               = round(d2$ppm, 3),
+    mean_abu_S2_DI          = round(d2$mean_abu, 0),
+    CoV_S2_DI               = round(d2$cov, 1),
+    mz_S2_FAIMS             = round(f2$mz, 5),
+    ppm_S2_FAIMS            = round(f2$ppm, 3),
+    mean_abu_S2_FAIMS_best  = round(f2$mean_abu, 0),
+    CoV_S2_FAIMS_best       = round(f2$cov, 1),
+    log2FC_DI_S1vsS2        = round(fc_di,    3),
+    log2FC_FAIMS_S1vsS2     = round(fc_faims, 3),
+    pval_DI_S1vsS2          = signif(p_di,    4),
+    pval_FAIMS_S1vsS2       = signif(p_faims, 4),
+    highest_abundance_in    = best_lbl,
+    best_CV_S1_FAIMS        = f1$best_cv,
+    best_CV_S2_FAIMS        = f2$best_cv,
+    log2FC_S1_DI_vs_FAIMS   = round(fc_s1_di_vs_faims, 3),
+    pval_S1_DI_vs_FAIMS     = signif(p_s1_di_vs_faims,  4),
+    log2FC_S2_DI_vs_FAIMS   = round(fc_s2_di_vs_faims, 3),
+    pval_S2_DI_vs_FAIMS     = signif(p_s2_di_vs_faims,  4),
+    stringsAsFactors = FALSE
+  )
+})
+
+excel_df <- bind_rows(rows_list)
+
+# Rename columns to human-friendly names
+colnames(excel_df) <- c(
+  "Lipid name",
+  "Theoretical m/z",
+  sprintf("m/z in %s DI", sample1_name),
+  sprintf("ppm %s DI",    sample1_name),
+  sprintf("Mean abundance %s DI",      sample1_name),
+  sprintf("CoV %s DI (%%)",            sample1_name),
+  sprintf("m/z in %s FAIMS",           sample1_name),
+  sprintf("ppm %s FAIMS",              sample1_name),
+  sprintf("Mean abundance %s FAIMS best-CV", sample1_name),
+  sprintf("CoV %s FAIMS best-CV (%%)", sample1_name),
+  sprintf("m/z in %s DI",             sample2_name),
+  sprintf("ppm %s DI",                sample2_name),
+  sprintf("Mean abundance %s DI",      sample2_name),
+  sprintf("CoV %s DI (%%)",            sample2_name),
+  sprintf("m/z in %s FAIMS",           sample2_name),
+  sprintf("ppm %s FAIMS",              sample2_name),
+  sprintf("Mean abundance %s FAIMS best-CV", sample2_name),
+  sprintf("CoV %s FAIMS best-CV (%%)", sample2_name),
+  sprintf("log2 FC %s/%s DI",          sample1_name, sample2_name),
+  sprintf("log2 FC %s/%s FAIMS best-CV", sample1_name, sample2_name),
+  sprintf("p-value %s vs %s DI (one-sided)", sample1_name, sample2_name),
+  sprintf("p-value %s vs %s FAIMS best-CV",  sample1_name, sample2_name),
+  "Highest abundance in",
+  sprintf("Best CV %s FAIMS",  sample1_name),
+  sprintf("Best CV %s FAIMS",  sample2_name),
+  sprintf("log2 FC %s DI vs FAIMS best-CV", sample1_name),
+  sprintf("p-value %s DI vs FAIMS best-CV (one-sided)", sample1_name),
+  sprintf("log2 FC %s DI vs FAIMS best-CV", sample2_name),
+  sprintf("p-value %s DI vs FAIMS best-CV (one-sided)", sample2_name)
+)
+
+# Write Excel
+wb <- createWorkbook()
+addWorksheet(wb, "IS Comparison")
+writeData(wb, "IS Comparison", excel_df)
+
+# Header style
+hdr_style <- createStyle(
+  fontName = "Arial", fontSize = 11, fontColour = "#FFFFFF",
+  fgFill = "#2F5496", halign = "CENTER", valign = "CENTER",
+  wrapText = TRUE, textDecoration = "Bold"
+)
+addStyle(wb, "IS Comparison", hdr_style,
+         rows = 1, cols = seq_len(ncol(excel_df)), gridExpand = TRUE)
+
+# Colour CoV columns (cols 6, 10, 14, 18)
+cov_col_indices <- c(6, 10, 14, 18)
+cov_col_names   <- colnames(excel_df)[cov_col_indices]
+for (ci in cov_col_indices)
+  add_cov_colours(wb, "IS Comparison", ci,
+                  as.numeric(excel_df[[ci]]))
+
+# Colour log2 FC columns (cols 19, 20)
+for (ci in 19:20)
+  add_log2fc_colours(wb, "IS Comparison", ci,
+                     as.numeric(excel_df[[ci]]),
+                     threshold = faims_di_fc_threshold)
+
+# Colour p-value columns (cols 21, 22)
+for (ci in 21:22)
+  add_pvalue_colours(wb, "IS Comparison", ci,
+                     as.numeric(excel_df[[ci]]))
+
+# Colour within-sample DI vs FAIMS log2 FC columns (cols 26, 28)
+for (ci in c(26, 28))
+  add_log2fc_colours(wb, "IS Comparison", ci,
+                     as.numeric(excel_df[[ci]]),
+                     threshold = faims_di_fc_threshold)
+
+# Colour within-sample DI vs FAIMS p-value columns (cols 27, 29)
+for (ci in c(27, 29))
+  add_pvalue_colours(wb, "IS Comparison", ci,
+                     as.numeric(excel_df[[ci]]))
+
+# Column widths
+col_widths <- c(24, 14, rep(c(14, 8, 18, 12, 14, 8, 18, 12), 2),
+                14, 14, 22, 22, 16, 14, 14,
+                22, 30, 22, 30)
+if (length(col_widths) < ncol(excel_df))
+  col_widths <- c(col_widths, rep(14, ncol(excel_df) - length(col_widths)))
+setColWidths(wb, "IS Comparison", cols = seq_len(ncol(excel_df)),
+             widths = col_widths)
+
+# Number format for m/z columns
+mz_style <- createStyle(numFmt = "0.00000")
+mz_col_idx <- grep("m/z in|Theoretical m/z", colnames(excel_df))
+if (length(mz_col_idx))
+  addStyle(wb, "IS Comparison", mz_style,
+           rows = 2:(nrow(excel_df) + 1), cols = mz_col_idx,
+           gridExpand = TRUE, stack = TRUE)
+
+freezePane(wb, "IS Comparison", firstRow = TRUE, firstCol = TRUE)
+
+# Legend sheet
+addWorksheet(wb, "Legend")
+legend_df <- data.frame(
+  Element  = c("CoV < 30 %", "CoV 30–50 %", "CoV > 50 %",
+               "log2 FC > threshold", "log2 FC < -threshold",
+               "p-value < 0.05"),
+  Colour   = c("Green", "Yellow", "Red", "Green", "Red", "Green"),
+  Meaning  = c("Good reproducibility", "Moderate reproducibility",
+               "Poor reproducibility",
+               sprintf("S1 > S2 (|log2FC| > %g)", faims_di_fc_threshold),
+               sprintf("S1 < S2 (|log2FC| > %g)", faims_di_fc_threshold),
+               "Statistically significant"),
+  stringsAsFactors = FALSE
+)
+writeData(wb, "Legend", legend_df)
+legend_fills <- c("#00B050","#FFFF00","#FF0000","#00B050","#FF0000","#00B050")
+for (i in seq_along(legend_fills))
+  addStyle(wb, "Legend", createStyle(fgFill = legend_fills[i]),
+           rows = i + 1, cols = 1:3, gridExpand = TRUE, stack = TRUE)
+setColWidths(wb, "Legend", cols = 1:3, widths = c(20, 10, 45))
+
+excel_out <- file.path(data_dir,
+                       sprintf("IS_two_sample_comparison_%s.xlsx", mode))
+saveWorkbook(wb, excel_out, overwrite = TRUE)
+cat("Excel output written:", excel_out, "\n")
+
+cat("\n=== Pipeline complete ===\n")
+cat("Outputs saved to:", data_dir, "\n")
+cat(sprintf("  boxplot_per_lipid_S1S2_%s.pdf\n", mode))
+cat(sprintf("  boxplot_abundance_spread_%s.{pdf,png}\n", mode))
+cat(sprintf("  heatmap_%s_best_CV_%s.{pdf,png}\n",  sample1_name, mode))
+cat(sprintf("  heatmap_%s_all_CVs_%s.{pdf,png}\n",  sample1_name, mode))
+cat(sprintf("  heatmap_%s_best_CV_%s.{pdf,png}\n",  sample2_name, mode))
+cat(sprintf("  heatmap_%s_all_CVs_%s.{pdf,png}\n",  sample2_name, mode))
+cat(sprintf("  IS_two_sample_comparison_%s.xlsx\n",  mode))
